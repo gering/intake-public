@@ -1,0 +1,167 @@
+services:
+  web:
+    build:
+      context: .
+      target: web
+    user: '10001:10001'
+    group_add: ['10010']
+    init: true
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    restart: unless-stopped
+    stop_grace_period: 20s
+    pids_limit: 64
+    mem_limit: 256m
+    expose: ['3000']
+    networks: [tunnel]
+    depends_on:
+      writer:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      INTAKE_HOST: 0.0.0.0
+      PORT: '3000'
+      INTAKE_DB: /var/lib/intake/public/tickets.sqlite
+      INTAKE_SOCKET: /run/intake/writer.sock
+      INTAKE_HMAC_KEY_FILE: /run/secrets/token_hmac_key
+      INTAKE_PUBLIC_URL: ${INTAKE_PUBLIC_URL:-https://intake.example.com}
+      INTAKE_MAX_TTL: ${INTAKE_MAX_TTL:-7d}
+      INTAKE_HSTS_MAX_AGE: ${INTAKE_HSTS_MAX_AGE:-31536000}
+      INTAKE_HSTS_INCLUDE_SUBDOMAINS: ${INTAKE_HSTS_INCLUDE_SUBDOMAINS:-true}
+      INTAKE_CLIENT_IP_HEADER: ${INTAKE_CLIENT_IP_HEADER-cf-connecting-ip}
+      TRUST_PROXY: 'false'
+    secrets: [token_hmac_key]
+    volumes:
+      - intake-sock:/run/intake:ro
+      - intake-shared:/var/lib/intake/public
+    healthcheck:
+      test: [CMD, node, docker/healthcheck.js, web]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  writer:
+    build:
+      context: .
+      target: writer
+    user: '10002:10010'
+    group_add: ['10010']
+    init: true
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    restart: unless-stopped
+    stop_grace_period: 90s
+    pids_limit: 128
+    mem_limit: 512m
+    networks: [egress]
+    depends_on:
+      bw:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      INTAKE_DB: /var/lib/intake/public/tickets.sqlite
+      INTAKE_PRIVATE_DB: /var/lib/intake/private/keys.sqlite
+      INTAKE_SOCKET: /run/intake/writer.sock
+      INTAKE_HMAC_KEY_FILE: /run/secrets/token_hmac_key
+      INTAKE_WRITER_KEY_FILE: /run/secrets/writer_master_key
+      INTAKE_FINGERPRINT_KEY_FILE: /run/secrets/fingerprint_key
+      INTAKE_PUBLIC_URL: ${INTAKE_PUBLIC_URL:-https://intake.example.com}
+      INTAKE_MAX_TTL: ${INTAKE_MAX_TTL:-7d}
+      INTAKE_DEFAULT_NOTIFY_EMAIL: ${INTAKE_DEFAULT_NOTIFY_EMAIL:-ops@example.com}
+      INTAKE_NOTIFY: 'on'
+      MAIL_API_URL: ${MAIL_API_URL:-https://mail.example.com}
+      MAIL_API_MAILBOX: ${MAIL_API_MAILBOX:-intake@example.com}
+      MAIL_API_TOKEN_FILE: /run/secrets/mail_api_token
+      INTAKE_BW_SOCKET: /run/intake-bw/bw.sock
+      BW_ORGANIZATION_ID: ${BW_ORGANIZATION_ID:?Set BW_ORGANIZATION_ID}
+      BW_COLLECTION_ID: ${BW_COLLECTION_ID:?Set BW_COLLECTION_ID}
+      BW_SYNC_BEFORE_WRITE: 'true'
+      INTAKE_VAULT_RETRY_BASE_MS: ${INTAKE_VAULT_RETRY_BASE_MS:-5000}
+      INTAKE_VAULT_RETRY_MAX_MS: ${INTAKE_VAULT_RETRY_MAX_MS:-300000}
+      INTAKE_STUCK_ATTEMPTS: ${INTAKE_STUCK_ATTEMPTS:-10}
+      INTAKE_UNKNOWN_SETTLE_MS: ${INTAKE_UNKNOWN_SETTLE_MS:-120000}
+      BW_MAX_RESPONSE_BYTES: ${BW_MAX_RESPONSE_BYTES:-1048576}
+    secrets:
+      [token_hmac_key, writer_master_key, fingerprint_key, mail_api_token]
+    volumes:
+      - intake-sock:/run/intake
+      - intake-shared:/var/lib/intake/public
+      - intake-writer:/var/lib/intake/private
+      - bw-sock:/run/intake-bw:ro
+    healthcheck:
+      test: [CMD, node, docker/healthcheck.js, writer]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  bw:
+    build:
+      context: .
+      target: bw
+    user: '10002:10010'
+    init: true
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    restart: unless-stopped
+    stop_grace_period: 30s
+    pids_limit: 256
+    mem_limit: 1g
+    networks: [egress]
+    environment:
+      NODE_ENV: production
+      HOME: /var/lib/intake/bw
+      BITWARDENCLI_APPDATA_DIR: /var/lib/intake/bw
+      BW_SERVER: ${VAULT_URL:-https://vault.example.com}
+      BW_CLIENTID_FILE: /run/secrets/bw_client_id
+      BW_CLIENTSECRET_FILE: /run/secrets/bw_client_secret
+      BW_PASSWORD_FILE: /run/secrets/bw_master_password
+    secrets: [bw_client_id, bw_client_secret, bw_master_password]
+    volumes:
+      - bw-sock:/run/intake-bw
+      - bw-data:/var/lib/intake/bw
+    healthcheck:
+      test: [CMD, node, docker/healthcheck.js, bw]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+networks:
+  # Join the HTTPS tunnel connector to this pre-existing network too.
+  tunnel:
+    external: true
+    name: ${INTAKE_TUNNEL_NETWORK:-intake-tunnel}
+  egress:
+    driver: bridge
+
+volumes:
+  intake-sock:
+  intake-shared:
+  intake-writer:
+  bw-sock:
+  bw-data:
+
+# File-backed Compose secrets retain host ownership/mode; see README.md.
+secrets:
+  token_hmac_key:
+    file: ${INTAKE_HMAC_KEY_PATH:-./secrets/token_hmac_key}
+  writer_master_key:
+    file: ${INTAKE_WRITER_KEY_PATH:-./secrets/writer_master_key}
+  fingerprint_key:
+    file: ${INTAKE_FINGERPRINT_KEY_PATH:-./secrets/fingerprint_key}
+  mail_api_token:
+    file: ${MAIL_API_TOKEN_PATH:-./secrets/mail_api_token}
+  bw_client_id:
+    file: ${BW_CLIENTID_PATH:-./secrets/bw_client_id}
+  bw_client_secret:
+    file: ${BW_CLIENTSECRET_PATH:-./secrets/bw_client_secret}
+  bw_master_password:
+    file: ${BW_PASSWORD_PATH:-./secrets/bw_master_password}

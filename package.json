@@ -1,0 +1,33 @@
+{
+  "name": "intake",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Single-use, browser-encrypted secret intake",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18 <23"
+  },
+  "bin": {
+    "intake": "src/cli.js"
+  },
+  "scripts": {
+    "web": "node src/web-main.js",
+    "writer": "node src/writer-main.js",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "node --test",
+    "verify": "npm run lint && npm run format:check && npm test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.10",
+    "yaml": "2.9.1"
+  }
+}

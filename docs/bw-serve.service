@@ -1,0 +1,37 @@
+[Unit]
+Description=Unlocked local vault CLI management API for intake
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=intake-writer
+Group=intake-writer
+WorkingDirectory=/var/lib/intake/bw
+Environment=HOME=/var/lib/intake/bw
+Environment=BITWARDENCLI_APPDATA_DIR=/var/lib/intake/bw
+EnvironmentFile=/etc/intake/bw.env
+RuntimeDirectory=intake-bw
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/bin/bw serve --hostname unix:///run/intake-bw/bw.sock
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/opt/intake /etc/intake
+ReadWritePaths=/var/lib/intake/bw
+InaccessiblePaths=/var/lib/intake/private /var/lib/intake/public /run/intake
+
+[Install]
+WantedBy=multi-user.target

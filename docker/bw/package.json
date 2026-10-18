@@ -1,0 +1,16 @@
+{
+  "name": "intake-bw",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Locked Bitwarden CLI dependencies for the vault image",
+  "license": "MIT",
+  "dependencies": {
+    "@bitwarden/cli": "2026.9.1"
+  },
+  "overrides": {
+    "multer": "2.4.0",
+    "external-editor": {
+      "tmp": "0.2.7"
+    }
+  }
+}

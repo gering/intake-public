@@ -1,0 +1,11 @@
+node_modules/
+secrets/
+data/
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.db*
+*.sock
+*.key
+coverage/

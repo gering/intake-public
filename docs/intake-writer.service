@@ -1,0 +1,36 @@
+[Unit]
+Description=Intake vault writer and completion mail service
+Requires=bw-serve.service
+After=network-online.target systemd-tmpfiles-setup.service bw-serve.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=intake-writer
+Group=intake-writer
+SupplementaryGroups=intake-sock
+WorkingDirectory=/opt/intake
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/intake/writer.env
+ExecStart=/usr/bin/node /opt/intake/src/writer-main.js
+UMask=0007
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=180s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/opt/intake /etc/intake
+ReadWritePaths=/var/lib/intake/public /var/lib/intake/private /run/intake
+InaccessiblePaths=/var/lib/intake/bw
+
+[Install]
+WantedBy=multi-user.target

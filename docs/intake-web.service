@@ -1,0 +1,34 @@
+[Unit]
+Description=Intake public HTTP service
+After=network.target systemd-tmpfiles-setup.service
+Wants=intake-writer.service
+
+[Service]
+Type=exec
+User=intake-web
+Group=intake-sock
+WorkingDirectory=/opt/intake
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/intake/web.env
+ExecStart=/usr/bin/node /opt/intake/src/web-main.js
+UMask=0007
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=60s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/opt/intake /etc/intake
+ReadWritePaths=/var/lib/intake/public /run/intake
+InaccessiblePaths=/var/lib/intake/private /var/lib/intake/bw
+
+[Install]
+WantedBy=multi-user.target
