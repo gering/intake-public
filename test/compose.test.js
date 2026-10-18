@@ -34,14 +34,17 @@ const roleSecrets = {
 function assertNoPorts(value) {
   if (!value || typeof value !== 'object') return;
   for (const [key, child] of Object.entries(value)) {
-    assert.notEqual(key, 'ports', 'No published ports anywhere in the stack');
+    assert.notEqual(key, 'ports', 'No other published ports in the stack');
     assertNoPorts(child);
   }
 }
 
-test('Compose parses and hardens all three non-root services without published ports', () => {
+test('Compose parses and hardens all three non-root services', () => {
   assert.deepEqual(Object.keys(stack.services).sort(), ['bw', 'web', 'writer']);
-  assertNoPorts(stack);
+  const { web, ...rest } = stack.services;
+  const { ports, ...webWithoutPorts } = web;
+  assert.deepEqual(ports, ['${INTAKE_WEB_BIND:-127.0.0.1:3093}:3000']);
+  assertNoPorts({ ...stack, services: { ...rest, web: webWithoutPorts } });
   for (const [role, service] of Object.entries(stack.services)) {
     assert.equal(service.read_only, true);
     assert.deepEqual(service.tmpfs, ['/tmp']);

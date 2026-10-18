@@ -604,8 +604,10 @@ remain a supported alternative.
 
 - **web** runs as `10001:10001`, with supplementary group `10010`, and belongs
   only to the external `tunnel` network. The trusted connector joins that network
-  and targets **`http://web:3000`** for `https://intake.example.com`. There are no
-  published host ports; `expose` is documentation, not an access-control rule.
+  and targets **`http://web:3000`** for `https://intake.example.com`. Web's only
+  published host port is `INTAKE_WEB_BIND`, loopback-only by default (see
+  [Host port binding](#host-port-binding)); `expose` is documentation, not an
+  access-control rule.
 - **writer** runs as `10002:10010`, with the shared socket group `10010`, and
   belongs only to the stack's `egress` bridge. It reaches the mail API via HTTPS
   and the unlocked local vault API via a private Unix socket, not a TCP port.
@@ -731,7 +733,8 @@ regenerate keys during an ordinary rebuild, restart, or upgrade.
 The connector's external network must already exist. Create it only if it is
 not already managed by your tunnel deployment, using the configured name, for
 example `docker network create intake-tunnel`. Join the trusted connector to it
-and configure the HTTPS route to `http://web:3000`; do not publish a host port.
+and configure the HTTPS route to `http://web:3000`, or, for a connector on the host
+network, to `http://127.0.0.1:3093` (see [Host port binding](#host-port-binding)).
 The web image explicitly sets `INTAKE_HOST=0.0.0.0` inside its network namespace;
 the non-Docker application default remains `127.0.0.1`.
 
@@ -798,7 +801,8 @@ alone does not verify remote token refresh or collection access.
 The compose stack sets `INTAKE_CLIENT_IP_HEADER=cf-connecting-ip` by default. This
 is only safe while web is reachable **exclusively through the trusted tunnel
 connector**, which removes/overwrites client-supplied copies. Network membership
-alone is not that guarantee: verify host and peer access too. Otherwise set
+alone is not that guarantee: verify host and peer access too, including local
+processes that can reach the loopback `INTAKE_WEB_BIND` port. Otherwise set
 `INTAKE_CLIENT_IP_HEADER=off` to disable it; clients could spoof their IP.
 Do not enable `TRUST_PROXY` or pass arbitrary forwarding headers through. With
 the header enabled, open/submit requests with a missing, invalid, or repeated
@@ -807,6 +811,29 @@ it. Warnings are throttled as described in the reverse-proxy section below.
 HSTS defaults to one year; if the tunnel/proxy sets it on all responses, set
 `INTAKE_HSTS_MAX_AGE=off` here to avoid duplicates. Do not add caching, body/token
 logging, or third-party scripts at the tunnel.
+
+### Host port binding
+
+`INTAKE_WEB_BIND` sets the host side of web's single published port,
+`<host-address>:<host-port>`, mapped to container port `3000`. It lets a tunnel
+connector that runs on the **host network** reach web without joining the
+`tunnel` network. The default is **`127.0.0.1:3093`**: loopback only, reachable
+from the deployment host itself but not from other machines. An empty or unset
+value uses this default.
+
+```sh
+# Default; the host-network connector targets http://127.0.0.1:3093
+INTAKE_WEB_BIND=127.0.0.1:3093
+# Different loopback port
+INTAKE_WEB_BIND=127.0.0.1:8093
+```
+
+**Never set it to `0.0.0.0:<port>`, `[::]:<port>`, a bare port such as `3093`,
+or a public interface address.** Docker then publishes web on every matching
+interface, usually past the host firewall, and clients can bypass the tunnel and
+spoof the client IP header. Even on loopback, any local process or user on the
+host can reach web directly; treat host access as part of the client IP header
+trust boundary above.
 
 ### Operate, inspect, and upgrade
 

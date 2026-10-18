@@ -15,6 +15,9 @@ services:
     pids_limit: 64
     mem_limit: 256m
     expose: ['3000']
+    # Host binding for a connector on the host network. Loopback-only by default;
+    # never set it to 0.0.0.0 or a public address (see README.md).
+    ports: ['${INTAKE_WEB_BIND:-127.0.0.1:3093}:3000']
     networks: [tunnel]
     depends_on:
       writer:
