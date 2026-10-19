@@ -8,6 +8,7 @@ import fs, {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -70,6 +71,60 @@ test('new databases use the requested modes and retain SQLite hardening', (t) =>
       () => db.exec("DELETE FROM sqlite_schema WHERE name = 'tickets'"),
       /may not be modified/,
     );
+  }
+});
+
+test('a database created by a concurrent first open is reused', (t) => {
+  const { path } = fixture(t);
+  const originalOpen = fs.openSync;
+  let raced = false;
+  const mock = t.mock.method(fs, 'openSync', (target, flags, mode) => {
+    if (!raced && target === path && flags & fs.constants.O_EXCL) {
+      raced = true;
+      const fd = originalOpen(target, flags, mode);
+      try {
+        fs.fchmodSync(fd, mode);
+      } finally {
+        fs.closeSync(fd);
+      }
+      const error = new Error('file exists');
+      error.code = 'EEXIST';
+      throw error;
+    }
+    return originalOpen(target, flags, mode);
+  });
+  syncBuiltinESMExports();
+  try {
+    const db = openDatabase(path, 0o660, ['tickets']);
+    t.after(() => db.close());
+    assert.equal(raced, true);
+    assert.equal(lstatSync(path).mode & 0o777, 0o660);
+    assert.equal(db.pragma('quick_check', { simple: true }), 'ok');
+    assert.equal(db.pragma('database_list')[0].file, path);
+  } finally {
+    mock.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('an exclusive-create collision still fails when no valid file exists', (t) => {
+  const { path } = fixture(t);
+  const originalOpen = fs.openSync;
+  const mock = t.mock.method(fs, 'openSync', (target, flags, mode) => {
+    if (target === path) {
+      const error = new Error('file exists');
+      error.code = 'EEXIST';
+      throw error;
+    }
+    return originalOpen(target, flags, mode);
+  });
+  syncBuiltinESMExports();
+  try {
+    unsafe(() => openDatabase(path, 0o660, ['tickets']));
+    assert.equal(existsSync(path), false);
+  } finally {
+    mock.mock.restore();
+    syncBuiltinESMExports();
   }
 });
 
@@ -387,6 +442,83 @@ test('ordinary private sidecars may have broader modes inside the private parent
   assert.equal(second.db.pragma('quick_check', { simple: true }), 'ok');
 });
 
+test('a missing parent directory is database_unavailable', (t) => {
+  const { dir } = fixture(t);
+  const path = join(dir, 'absent', 'tickets.db');
+  unsafe(() => openDatabase(path, 0o660, ['tickets']), 'database_unavailable');
+  unsafe(() => new TicketStore(path), 'database_unavailable');
+  unsafe(
+    () => new PrivateKeyStore(join(dir, 'absent', 'keys.db')),
+    'database_unavailable',
+  );
+  assert.equal(existsSync(path), false);
+});
+
+test('an unreadable database parent is database_unavailable', (t) => {
+  const { dir, path } = fixture(t);
+  chmodSync(dir, 0o000);
+  try {
+    unsafe(
+      () => openDatabase(path, 0o660, ['tickets']),
+      'database_unavailable',
+    );
+    assert.equal(existsSync(path), false);
+  } finally {
+    chmodSync(dir, 0o700);
+  }
+});
+
+test('busy and locked migration errors are database_unavailable and close the handle', (t) => {
+  const { SqliteError } = Database;
+  for (const code of ['SQLITE_BUSY', 'SQLITE_BUSY_SNAPSHOT', 'SQLITE_LOCKED']) {
+    const { path } = fixture(t);
+    let opened;
+    const exec = t.mock.method(Database.prototype, 'exec', function () {
+      opened = this;
+      throw new SqliteError('database is locked', code);
+    });
+    try {
+      unsafe(() => new TicketStore(path), 'database_unavailable');
+      assert.equal(opened.open, false);
+    } finally {
+      exec.mock.restore();
+    }
+  }
+});
+
+test('a busy error while opening is database_unavailable and closes SQLite', (t) => {
+  const { path } = fixture(t);
+  const { SqliteError } = Database;
+  let opened;
+  withPragmaMock(t, function (source, run) {
+    if (String(source).startsWith('busy_timeout')) {
+      opened = this;
+      throw new SqliteError('database is locked', 'SQLITE_BUSY');
+    }
+    return run();
+  });
+  unsafe(() => openDatabase(path, 0o660, ['tickets']), 'database_unavailable');
+  assert.equal(opened.open, false);
+});
+
+test('non-lock SQLite failures stay unsafe_database', (t) => {
+  const { path } = fixture(t);
+  let opened;
+  const exec = t.mock.method(Database.prototype, 'exec', function () {
+    opened = this;
+    throw new Database.SqliteError(
+      'database disk image is malformed',
+      'SQLITE_CORRUPT',
+    );
+  });
+  try {
+    unsafe(() => new TicketStore(path));
+    assert.equal(opened.open, false);
+  } finally {
+    exec.mock.restore();
+  }
+});
+
 test('migration errors close the connection and hide SQLite details', (t) => {
   const { path } = fixture(t);
   const initial = openDatabase(path, 0o660, ['tickets']);
@@ -482,6 +614,37 @@ test('database_list must resolve to the validated path', (t) => {
   assert.equal(opened.open, false);
 });
 
+for (const code of ['SQLITE_BUSY', 'SQLITE_BUSY_SNAPSHOT', 'SQLITE_LOCKED']) {
+  test(`identity validation maps ${code} to database_unavailable and closes SQLite`, (t) => {
+    const { path } = fixture(t);
+    let opened;
+    withPragmaMock(t, function (source, run) {
+      if (source === 'database_list') {
+        opened = this;
+        throw new Database.SqliteError('fixture lock details', code);
+      }
+      return run();
+    });
+    unsafe(
+      () => openDatabase(path, 0o660, ['tickets']),
+      'database_unavailable',
+    );
+    assert.equal(opened.open, false);
+  });
+}
+
+test('permission-bit failures found after open keep their code', (t) => {
+  const { dir, path } = fixture(t);
+  withPragmaMock(t, function (source, run) {
+    if (source === 'trusted_schema = OFF') chmodSync(dir, 0o707);
+    return run();
+  });
+  unsafe(
+    () => openDatabase(path, 0o660, ['tickets']),
+    'unsafe_database_permissions',
+  );
+});
+
 for (const identity of ['dev', 'ino']) {
   test(`database ${identity} replacement during opening is rejected and closes SQLite`, (t) => {
     const { path } = fixture(t);
@@ -508,3 +671,40 @@ for (const identity of ['dev', 'ino']) {
     }
   });
 }
+
+test('a database file removed after open is unsafe_database', (t) => {
+  const { path } = fixture(t);
+  let opened;
+  withPragmaMock(t, function (source, run) {
+    if (String(source).startsWith('trusted_schema')) {
+      opened = this;
+      renameSync(path, `${path}.moved`);
+    }
+    return run();
+  });
+  unsafe(() => openDatabase(path, 0o660, ['tickets']));
+  assert.equal(existsSync(path), false);
+  assert.equal(opened.open, false);
+});
+
+test('an unreadable database after open is unsafe_database', (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip('root ignores directory mode bits');
+    return;
+  }
+  const { dir, path } = fixture(t);
+  let opened;
+  withPragmaMock(t, function (source, run) {
+    if (String(source).startsWith('trusted_schema')) {
+      opened = this;
+      chmodSync(dir, 0o000);
+    }
+    return run();
+  });
+  try {
+    unsafe(() => openDatabase(path, 0o660, ['tickets']));
+    assert.equal(opened.open, false);
+  } finally {
+    chmodSync(dir, 0o700);
+  }
+});

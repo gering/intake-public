@@ -1,4 +1,8 @@
-import { openDatabase, validateDatabaseSchema } from './db-open.js';
+import {
+  databaseFailure,
+  openDatabase,
+  validateDatabaseSchema,
+} from './db-open.js';
 import { parseToken, verifyToken } from './tokens.js';
 import { unavailable, IntakeError } from './errors.js';
 import { validateEnvelope } from './crypto.js';
@@ -9,9 +13,13 @@ function connection(path, mode, tables, migrate) {
     migrate(db);
     validateDatabaseSchema(db, tables);
     return db;
-  } catch {
-    if (db.open) db.close();
-    throw new IntakeError('unsafe_database');
+  } catch (error) {
+    try {
+      if (db.open) db.close();
+    } catch {
+      // Preserve the classified error even if closing also fails.
+    }
+    throw databaseFailure(error);
   }
 }
 

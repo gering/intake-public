@@ -563,8 +563,9 @@ and `inquirer`/`external-editor`/`tmp`. CLI 2026.10.0 does not resolve them
 finding), so the image keeps 2026.9.1 and `docker/bw/package.json` declares
 targeted npm `overrides` for the fixable high findings:
 
-- `multer` 2.2.0 → 2.4.0 (same major; the CLI and `@koa/multer` use the
-  unchanged public API). This also clears the low `multer` finding.
+- `multer` 2.2.0 → 2.4.0, scoped to `@bitwarden/cli` (same major; the CLI and
+  `@koa/multer` use the unchanged public API). This also clears the low
+  `multer` finding.
 - `tmp` 0.0.33 → 0.2.7, scoped to `external-editor`, which only calls
   `tmpNameSync`. This also clears the low `tmp`, `external-editor`, and
   `inquirer` entries.
@@ -572,10 +573,14 @@ targeted npm `overrides` for the fixable high findings:
 With the overrides, `npm audit` reports **2 entries (2 high)**: `node-forge`
 1.4.0 ([GHSA-86w9-cpqp-85rv](https://github.com/advisories/GHSA-86w9-cpqp-85rv),
 no patched release exists) and `@bitwarden/cli`, which depends on it. Both stay
-until upstream publishes a fix. The overrides pin versions outside the CLI's
-exact dependency pins, so validate the vault service end to end (login, unlock,
-item creation in the target collection through `bw serve`) after every change
-to `docker/bw`, and drop overrides once a CLI release ships fixed versions.
+until upstream publishes a fix. The advisory concerns RSA PKCS#1 v1.5 signature
+verification; the CLI uses node-forge only for AES decryption, HMAC and hashes,
+not for RSA signature verification, and `bw serve` has no published port; the
+writer is the only other service that mounts its private Unix socket.
+The overrides pin versions outside the CLI's exact dependency pins, so
+validate the vault service end to end (login, unlock, item creation in the
+target collection through `bw serve`) after every change to `docker/bw`,
+and drop overrides once a CLI release ships fixed versions.
 
 Deploy `docker-compose.yml` as a **Portainer repository stack**, built directly
 from the Git repository through each service's `build:` target; no registry or
@@ -730,8 +735,10 @@ regenerate keys during an ordinary rebuild, restart, or upgrade.
 
 ### First start and tunnel configuration
 
-The connector's external network must already exist. Create it only if it is
-not already managed by your tunnel deployment, using the configured name, for
+The connector's external network must already exist before `docker compose up`,
+including when the connector only uses the host port: web stays attached to the
+network named by `INTAKE_TUNNEL_NETWORK`. Create that network when it is not
+already managed by your tunnel deployment, using the configured name, for
 example `docker network create intake-tunnel`. Join the trusted connector to it
 and configure the HTTPS route to `http://web:3000`, or, for a connector on the host
 network, to `http://127.0.0.1:3093` (see [Host port binding](#host-port-binding)).
@@ -817,9 +824,11 @@ logging, or third-party scripts at the tunnel.
 `INTAKE_WEB_BIND` sets the host side of web's single published port,
 `<host-address>:<host-port>`, mapped to container port `3000`. It lets a tunnel
 connector that runs on the **host network** reach web without joining the
-`tunnel` network. The default is **`127.0.0.1:3093`**: loopback only, reachable
-from the deployment host itself but not from other machines. An empty or unset
-value uses this default.
+`tunnel` network. Web stays attached to the external tunnel network even when
+the connector only uses the host port, so the network named by
+`INTAKE_TUNNEL_NETWORK` must exist for `docker compose up`. The default is
+**`127.0.0.1:3093`**: loopback only, reachable from the deployment host itself
+but not from other machines. An empty or unset value uses this default.
 
 ```sh
 # Default; the host-network connector targets http://127.0.0.1:3093
@@ -834,6 +843,26 @@ interface, usually past the host firewall, and clients can bypass the tunnel and
 spoof the client IP header. Even on loopback, any local process or user on the
 host can reach web directly; treat host access as part of the client IP header
 trust boundary above.
+
+Docker Engine releases before 28.0.0 did not drop packets from hosts on the same
+network segment addressed to ports published on `127.0.0.1`, so such a neighbor
+could reach the loopback port (fixed in 28.0.0,
+[moby/moby#49325](https://github.com/moby/moby/pull/49325)). Docker 28.2.0
+through 28.3.2 could lose that protection after a firewalld reload
+([CVE-2025-54388](https://github.com/advisories/GHSA-x4rx-4gw3-53p4), fixed in
+28.3.3). Use Docker Engine 28.3.3 or later. Otherwise firewall the host so the
+published port is unreachable from the network. Do not set
+`DOCKER_INSECURE_NO_IPTABLES_RAW=1`; it disables this protection.
+
+Compose cannot validate `INTAKE_WEB_BIND`. After the stack is up, check the
+published address:
+
+```sh
+docker compose port web 3000
+```
+
+It must print `127.0.0.1:<port>`. If it shows `0.0.0.0`, `[::]`, or another
+address, stop the stack and fix `INTAKE_WEB_BIND`.
 
 ### Operate, inspect, and upgrade
 
@@ -864,6 +893,10 @@ capped backoff; fix their cause rather than deleting recovery material or
 reactivating the ticket. The warning is diagnostic, not a retry limit.
 Compare completion mail, the CLI summary, and vault reference fields as described
 below. `revoke`, `notify-retry`, and `purge` retain their existing safety limits.
+If the writer is down for more than the **15-minute** grace after a ticket's
+expiry, submissions made shortly before expiry are rejected with
+`failure_code=ticket_expired` and their key is removed at the next prune.
+Reissue the affected tickets.
 
 For upgrades, pause the tunnel route/new submissions or stop web, let writer
 finish accepted work and notifications, then stop writer **before bw**. Back up
@@ -1314,9 +1347,10 @@ configuration, all proxied clients can share the loopback rate-limit bucket.
 
 Alternatively, set `INTAKE_CLIENT_IP_HEADER=cf-connecting-ip` (or another valid
 HTTP header name) for a proxy that supplies one client IP in that header. Header
-names are case-insensitive; an unset setting or `off` (any case) disables this switch.
-Empty or whitespace-only values stop startup with `invalid_intake_client_ip_header`
-instead of silently grouping all tunnel users into one socket-IP bucket.
+names are case-insensitive; an unset setting or `off` (any case, surrounding
+whitespace ignored) disables this switch. Empty or whitespace-only values stop
+startup with `invalid_intake_client_ip_header` instead of silently grouping all
+tunnel users into one socket-IP bucket.
 **Enable it only when web is reachable exclusively through that trusted proxy**,
 for example through a tunnel connector with no direct route to web. The proxy
 must remove/overwrite client-supplied copies of the configured header. If clients
@@ -1487,9 +1521,12 @@ intake notify-retry "$TICKET_ID"
   cannot cancel pending/processing/unknown work or undo a stored vault entry.
   It asks the writer to latch revocation privately and remove the encrypted key
   immediately, without requiring private database access for the operator. If the
-  writer request fails, the CLI still exits successfully and reports deferred
+  writer cannot be reached, the CLI still exits successfully and reports deferred
   removal at the next writer prune (normally within **60 seconds** while running,
   or at startup). Private revocation persists even if shared state is later reset.
+  If the writer reports that the shared row is no longer revoked, it did not
+  remove the private key; the CLI reports that and exits non-zero. Inspect the
+  ticket with `show`.
 - `notify-retry` requests a retry **only for a failed notification** on a terminal
   `done` or `failed` ticket. It queues work over the Unix socket and returns
   before mail completion. It does not decrypt a value, create a vault item,
@@ -1674,10 +1711,12 @@ successful opens or submissions. Bad tokens, unknown tickets and unavailable
 tickets consume this allowance; malformed envelopes and internal errors do not.
 After the allowance is exhausted, all requests for that ticket ID return 429 until
 the fixed window expires, including requests carrying the valid token. Only
-someone who knows the ticket ID can trigger this lockout; IDs appear in CLI output,
-logs and notification mail but are not public. It lasts at most one rate window;
-wait for the window to expire, or revoke the ticket and issue a new one. Client
-limits are charged before the body is read, including malformed or oversized bodies.
+someone who knows the ticket ID can trigger this lockout. The ID is part of the
+link itself (`#req=<id>.<secret>`), so anyone who received the link knows it;
+IDs also appear in CLI output, logs and notification mail but are not public. It
+lasts at most one rate window; wait for the window to expire, or revoke the
+ticket and issue a new one. Client limits are charged before the body is read,
+including malformed or oversized bodies.
 
 Client and ticket buckets are stored in separate bounded maps, each with capacity
 `INTAKE_RATE_MAX_ENTRIES`. Capacity must be at least **2** so both native IPv6

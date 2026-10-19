@@ -237,7 +237,7 @@ test('help needs no credentials and error output never echoes raw filesystem err
   };
   const result = await invoke(['list'], env);
   assert.equal(result.code, 1);
-  assert.equal(result.stderr, 'intake: unsafe_database\n');
+  assert.equal(result.stderr, 'intake: database_unavailable\n');
   assert(!result.stderr.includes(f.dir));
 });
 

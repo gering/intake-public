@@ -8,7 +8,9 @@
     "@bitwarden/cli": "2026.9.1"
   },
   "overrides": {
-    "multer": "2.4.0",
+    "@bitwarden/cli": {
+      "multer": "2.4.0"
+    },
     "external-editor": {
       "tmp": "0.2.7"
     }

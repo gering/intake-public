@@ -128,7 +128,16 @@ export async function runCli(
           positionals[0],
           config.ipcTimeoutMs,
         );
-      } catch {
+      } catch (error) {
+        if (
+          error instanceof IntakeError &&
+          error.code === 'ticket_not_revoked'
+        ) {
+          stdout.write(
+            'Ticket revoked in shared state, but it is no longer revoked there. The writer did not remove the private key. Inspect it with show.\n',
+          );
+          return 1;
+        }
         stdout.write(
           'Ticket revoked. Writer unreachable; the private key is removed at the next writer prune.\n',
         );

@@ -8,6 +8,7 @@ test('terminal escaping renders every C0, DEL, C1 and specified Unicode control 
     ...Array.from({ length: 33 }, (_, index) => 0x7f + index),
     0x2028,
     0x2029,
+    0x061c,
     0x200e,
     0x200f,
     ...Array.from({ length: 5 }, (_, index) => 0x202a + index),

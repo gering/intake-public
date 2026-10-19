@@ -253,7 +253,7 @@ test('bw installs integrity-locked CLI dependencies without lifecycle scripts', 
   assert.equal(manifest.private, true);
   assert.deepEqual(manifest.dependencies, { '@bitwarden/cli': '2026.9.1' });
   assert.deepEqual(manifest.overrides, {
-    multer: '2.4.0',
+    '@bitwarden/cli': { multer: '2.4.0' },
     'external-editor': { tmp: '0.2.7' },
   });
   assert.equal(lock.lockfileVersion, 3);

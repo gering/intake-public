@@ -134,6 +134,31 @@ for (const failure of ['status', 'invalid JSON', 'disconnect', 'timeout']) {
   });
 }
 
+test('CLI revoke reports when shared state changed before the writer removed the key', async (t) => {
+  const f = await fixture(t);
+  const { ticket } = f.create();
+  const server = createServer((req, res) => {
+    req.resume();
+    res.writeHead(409);
+    res.end('{"error":"ticket_not_revoked"}');
+  });
+  await new Promise((resolve) => server.listen(f.config.socketPath, resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  await assert.rejects(
+    execute(process.execPath, [cliPath, 'revoke', '--', ticket.id], {
+      env: operatorEnv(f),
+    }),
+    {
+      code: 1,
+      stdout:
+        'Ticket revoked in shared state, but it is no longer revoked there. The writer did not remove the private key. Inspect it with show.\n',
+      stderr: '',
+    },
+  );
+  assert.equal(f.store.get(ticket.id).status, 'revoked');
+  assert(f.keys.get(ticket.id));
+});
+
 test('CLI revoke does not contact the writer when public revocation fails', async (t) => {
   const f = await fixture(t);
   const { ticket } = f.create();

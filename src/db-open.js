@@ -11,18 +11,42 @@ import {
 import { basename, dirname, join, resolve } from 'node:path';
 import { IntakeError } from './errors.js';
 
+const operationalFsCodes = new Set(['ENOENT', 'EACCES', 'EPERM']);
+
+function isDatabaseLockError(error) {
+  return (
+    typeof error?.code === 'string' &&
+    (error.code.startsWith('SQLITE_BUSY') ||
+      error.code.startsWith('SQLITE_LOCKED'))
+  );
+}
+
+function isOperationalDatabaseError(error) {
+  if (!(error instanceof Error) || error instanceof IntakeError) return false;
+  if (operationalFsCodes.has(error.code)) return true;
+  return isDatabaseLockError(error);
+}
+
+export function databaseFailure(error) {
+  if (
+    error instanceof IntakeError &&
+    (error.code === 'unsafe_database' ||
+      error.code === 'unsafe_database_permissions' ||
+      error.code === 'database_unavailable')
+  )
+    return error;
+  if (isOperationalDatabaseError(error))
+    return new IntakeError('database_unavailable');
+  return new IntakeError('unsafe_database');
+}
+
 function rejectDatabase(db, error) {
   try {
     if (db?.open) db.close();
   } catch {
     // Preserve the generic opening error even if closing also fails.
   }
-  if (
-    error instanceof IntakeError &&
-    error.code === 'unsafe_database_permissions'
-  )
-    throw error;
-  throw new IntakeError('unsafe_database');
+  throw databaseFailure(error);
 }
 
 function optionalStat(path) {
@@ -73,19 +97,26 @@ function sameFile(left, right) {
 }
 
 function validateIdentity(db, path, mode, original) {
-  validateParent(path, mode);
-  const current = validateFiles(path, mode);
-  const databases = db.pragma('database_list');
-  const main = databases.find(({ name }) => name === 'main');
-  if (
-    !main ||
-    databases.some(({ name }) => name !== 'main' && name !== 'temp') ||
-    resolve(main.file) !== path ||
-    realpathSync(main.file) !== path ||
-    !sameFile(original, current) ||
-    !sameFile(original, lstatSync(main.file))
-  )
+  // Once the handle is open, a missing or unreadable file is tampering.
+  // Lock errors stay operational so the caller can still map them.
+  try {
+    validateParent(path, mode);
+    const current = validateFiles(path, mode);
+    const databases = db.pragma('database_list');
+    const main = databases.find(({ name }) => name === 'main');
+    if (
+      !main ||
+      databases.some(({ name }) => name !== 'main' && name !== 'temp') ||
+      resolve(main.file) !== path ||
+      realpathSync(main.file) !== path ||
+      !sameFile(original, current) ||
+      !sameFile(original, lstatSync(main.file))
+    )
+      throw new IntakeError('unsafe_database');
+  } catch (error) {
+    if (error instanceof IntakeError || isDatabaseLockError(error)) throw error;
     throw new IntakeError('unsafe_database');
+  }
 }
 
 export function validateDatabaseSchema(
@@ -134,19 +165,29 @@ export function openDatabase(path, mode, expectedTables) {
       resolved = join(realpathSync(dirname(absolute)), basename(absolute));
       original = validateFiles(resolved, mode);
       if (!original) {
-        const fd = openSync(
-          resolved,
-          constants.O_CREAT |
-            constants.O_EXCL |
-            constants.O_RDWR |
-            constants.O_NOFOLLOW,
-          mode,
-        );
+        let fd;
         try {
-          fchmodSync(fd, mode);
-          original = fstatSync(fd);
-        } finally {
-          closeSync(fd);
+          fd = openSync(
+            resolved,
+            constants.O_CREAT |
+              constants.O_EXCL |
+              constants.O_RDWR |
+              constants.O_NOFOLLOW,
+            mode,
+          );
+        } catch (error) {
+          // Another process created the file after the empty check.
+          if (error.code !== 'EEXIST') throw error;
+          original = validateFiles(resolved, mode);
+          if (!original) throw new IntakeError('unsafe_database');
+        }
+        if (fd !== undefined) {
+          try {
+            fchmodSync(fd, mode);
+            original = fstatSync(fd);
+          } finally {
+            closeSync(fd);
+          }
         }
       }
     }

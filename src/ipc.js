@@ -20,10 +20,21 @@ export function writerRequest(socketPath, path, id, timeoutMs = 45000) {
           else chunks.push(chunk);
         });
         res.on('end', () => {
-          if (res.statusCode < 200 || res.statusCode >= 300)
+          const body = Buffer.concat(chunks).toString('utf8');
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            if (res.statusCode === 409) {
+              try {
+                const parsed = JSON.parse(body);
+                if (parsed?.error === 'ticket_not_revoked')
+                  return reject(new IntakeError('ticket_not_revoked', 409));
+              } catch {
+                // A non-JSON conflict keeps the generic non-2xx failure.
+              }
+            }
             return reject(new IntakeError('writer_request_failed', 503));
+          }
           try {
-            resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+            resolve(JSON.parse(body));
           } catch {
             reject(new IntakeError('writer_invalid_response', 503));
           }
