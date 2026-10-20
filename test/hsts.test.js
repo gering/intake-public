@@ -128,7 +128,7 @@ for (const [setting, includeSubDomains, expected] of [
       [() => fetch(f.base + '/app.js', { method: 'HEAD' }), 200],
       [() => post(f.base, '/api/open', { token: first.token }), 200],
       [() => post(f.base, '/api/open', { token: wrongToken }), 400],
-      [() => post(f.base, '/api/open', { token: first.token }), 429],
+      [() => post(f.base, '/api/open', { token: wrongToken }), 429],
       [
         () => post(f.base, '/api/submit', { token: second.token, envelope }),
         202,

@@ -5,9 +5,17 @@ import { assertNonRoot, IntakeError } from './errors.js';
 import { decryptValue } from './crypto.js';
 import { aadBytes } from '../public/crypto.js';
 import { metadataDigest } from './metadata.js';
+import { isDatabaseLockError } from './db-open.js';
 import { VaultError } from './vault.js';
 import { createLogger } from './logger.js';
 import { json, readJson, listen, closeServer } from './http.js';
+
+function isSqliteError(error) {
+  return (
+    error?.name === 'SqliteError' ||
+    (typeof error?.code === 'string' && error.code.startsWith('SQLITE_'))
+  );
+}
 
 export async function startWriter({
   store,
@@ -19,6 +27,7 @@ export async function startWriter({
   notifyOff = false,
   socketPath,
   pollMs = 1000,
+  shutdownWaitMs = 5000,
   expiryGraceMs = 900000,
   pruneIntervalMs = 60000,
   retryBaseMs = 5000,
@@ -56,6 +65,7 @@ export async function startWriter({
     throw new IntakeError('invalid_intake_stuck_attempts');
   for (const [value, code, minimum] of [
     [expiryGraceMs, 'invalid_intake_expiry_grace_ms', 0],
+    [shutdownWaitMs, 'invalid_intake_shutdown_wait_ms', 0],
     [pruneIntervalMs, 'invalid_intake_prune_interval_ms', 1],
   ]) {
     if (!Number.isSafeInteger(value) || value < minimum || value > 2147483647)
@@ -68,6 +78,9 @@ export async function startWriter({
   let ready = false;
   let recoveryNeeded = false;
   let vaultNotReady = false;
+  let notification;
+  let notificationAbandoned = false;
+  const notificationAbort = new AbortController();
 
   function warnStuck(transition) {
     if (
@@ -124,6 +137,9 @@ export async function startWriter({
     if (store.begin(id, now())) {
       let vaultAccepted = false;
       let lookupInProgress = false;
+      let lookupCompleted = false;
+      let writeStarted = false;
+      let decrypting = false;
       try {
         const snapshot = keys.getMetadata(id);
         if (!snapshot) throw new IntakeError('ticket_metadata_mismatch');
@@ -150,12 +166,16 @@ export async function startWriter({
           !Buffer.from(aadBytes(ticket)).equals(aadBytes(submitted))
         )
           throw new IntakeError('ticket_metadata_mismatch');
+        const encryptedPrivateKey = keys.get(id);
+        // Node crypto reports bad keys/envelopes as generic Error; these are definite.
+        decrypting = true;
         const decrypted = decryptValue(
           masterKey,
           ticket,
-          keys.get(id),
+          encryptedPrivateKey,
           submitted.envelope,
         );
+        decrypting = false;
         const fingerprint = ticketFingerprint(
           fingerprintKey,
           ticket.id,
@@ -174,8 +194,12 @@ export async function startWriter({
           lookupInProgress = true;
           found = await adapter.lookup(input);
           lookupInProgress = false;
+          lookupCompleted = true;
         }
-        if (!found) await adapter.write(input);
+        if (!found) {
+          writeStarted = true;
+          await adapter.write(input);
+        }
         vaultAccepted = true;
         if (!store.finish(id, fingerprint))
           throw new IntakeError('completion_commit_failed');
@@ -191,9 +215,25 @@ export async function startWriter({
             error instanceof VaultError ? error.code : 'writer_state_failed',
             vaultAccepted || !lookupInProgress,
           );
-        } else if (error instanceof VaultError && error.preDelivery) {
-          if (resolving) unknown(id, error.code);
-          else retry(id, error.code);
+        } else if (
+          (error instanceof VaultError && error.preDelivery) ||
+          isDatabaseLockError(error)
+        ) {
+          const code = isDatabaseLockError(error)
+            ? 'database_busy'
+            : error.code;
+          if (resolving) unknown(id, code);
+          else retry(id, code);
+          if (code === 'database_busy') return true;
+        } else if (
+          !(error instanceof IntakeError) &&
+          !decrypting &&
+          (resolving ? !lookupCompleted : !writeStarted)
+        ) {
+          // Keep material when local state fails before lookup or vault delivery.
+          if (resolving) unknown(id, 'writer_state_failed');
+          else retry(id, 'writer_state_failed');
+          if (isSqliteError(error)) return true;
         } else {
           const code =
             error instanceof IntakeError &&
@@ -216,34 +256,80 @@ export async function startWriter({
       ticket &&
       ['done', 'failed'].includes(ticket.status) &&
       ticket.notifyStatus === 'pending'
-    ) {
-      const metadata = keys.getMetadata(id);
-      const result = !metadata
-        ? {
-            status: 'failed',
-            attempts: 0,
-            error: 'private_metadata_missing',
-            notifiedAt: null,
-          }
-        : notifyOff
+    )
+      sendNotification(ticket);
+  }
+
+  function sendNotification(ticket) {
+    if (notification || stopped) return;
+    // SQLite holds the backlog; only one delivery is in flight, separate from vault work.
+    const delivery = { id: ticket.id };
+    notification = delivery;
+    delivery.promise = (async () => {
+      let recorded = false;
+      const { id } = ticket;
+      try {
+        const metadata = keys.getMetadata(id);
+        const result = !metadata
           ? {
               status: 'failed',
               attempts: 0,
-              error: 'disabled',
+              error: 'private_metadata_missing',
               notifiedAt: null,
             }
-          : await notifier.send({ ...ticket, ...metadata });
-      store.recordNotification(id, result);
-      logger.info('notification_result', {
-        id,
-        notifyStatus: result.status,
-        attempts: result.attempts,
-        code: result.error ?? 'ok',
-      });
+          : notifyOff
+            ? {
+                status: 'failed',
+                attempts: 0,
+                error: 'disabled',
+                notifiedAt: null,
+              }
+            : await notifier.send(
+                { ...ticket, ...metadata },
+                { signal: notificationAbort.signal },
+              );
+        // Only the shutdown deadline abandons a result, even if cancellation is ignored.
+        if (notificationAbandoned) return;
+        store.recordNotification(id, result);
+        recorded = true;
+        logger.info('notification_result', {
+          id,
+          notifyStatus: result.status,
+          attempts: result.attempts,
+          code: result.error ?? 'ok',
+        });
+      } catch {
+        // Keep pending after a send/commit error for recovery on a later poll or restart.
+        if (!notificationAbandoned)
+          logger.info('writer_loop_error', { code: 'internal_error' });
+      } finally {
+        notification = undefined;
+        if (recorded && !stopped) queueMicrotask(drainNotifications);
+      }
+    })();
+  }
+
+  function drainNotifications() {
+    if (notification || stopped) return;
+    try {
+      const id = store.nextNotification();
+      if (!id) return;
+      const ticket = store.getState(id);
+      if (
+        ticket &&
+        ['done', 'failed'].includes(ticket.status) &&
+        ticket.notifyStatus === 'pending'
+      ) {
+        keys.delete(id);
+        sendNotification(ticket);
+      }
+    } catch {
+      logger.info('writer_loop_error', { code: 'internal_error' });
     }
   }
 
   function drain() {
+    drainNotifications();
     if (running || stopped) return current;
     running = true;
     current = (async () => {
@@ -276,7 +362,8 @@ export async function startWriter({
         }
         for (const id of store.work(now())) {
           if (stopped) break;
-          await processTicket(id, vaultReady);
+          // Do not repeat a local SQLite failure for every due ticket.
+          if (await processTicket(id, vaultReady)) break;
         }
       } catch {
         recoveryNeeded = true;
@@ -292,7 +379,7 @@ export async function startWriter({
     { requestTimeout: 15000, headersTimeout: 10000, maxHeaderSize: 4096 },
     async (req, res) => {
       try {
-        if (!ready) throw new IntakeError('writer_starting', 503);
+        if (!ready || stopped) throw new IntakeError('writer_starting', 503);
         if (req.method === 'GET' && req.url === '/healthz') {
           res.writeHead(204);
           res.end();
@@ -350,7 +437,31 @@ export async function startWriter({
     async close() {
       stopped = true;
       clearInterval(timer);
-      await closeServer(server);
+      const serverClosed = closeServer(server);
+      const delivery = notification;
+      if (delivery) {
+        let timeout;
+        try {
+          if (shutdownWaitMs > 0)
+            await Promise.race([
+              delivery.promise,
+              new Promise((resolve) => {
+                timeout = setTimeout(resolve, shutdownWaitMs);
+              }),
+            ]);
+          if (notification === delivery) {
+            notificationAbandoned = true;
+            notificationAbort.abort();
+            logger.info('shutdown_notification_pending', {
+              id: delivery.id,
+              waitedMs: shutdownWaitMs,
+            });
+          }
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+      await serverClosed;
       await current;
     },
   };

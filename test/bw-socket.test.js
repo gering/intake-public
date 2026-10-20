@@ -33,11 +33,14 @@ test('socket helper logs internal and system error codes without paths or messag
     [f.path, 'vault_socket_not_socket'],
     [join(f.dir, 'sensitive-missing-parent', 'bw.sock'), 'ENOENT'],
   ]) {
-    await assert.rejects(execute(process.execPath, [helper, path]), {
-      code: 1,
-      stdout: '',
-      stderr: `Socket preparation failed (${code}).\n`,
-    });
+    await assert.rejects(
+      execute(process.execPath, [helper, path], { env: {} }),
+      {
+        code: 1,
+        stdout: '',
+        stderr: `Socket preparation failed (${code}).\n`,
+      },
+    );
   }
 });
 
@@ -49,12 +52,16 @@ test('socket helper redacts unsafe or absent error codes rather than logging an 
       fs.lstat = async () => { throw Object.assign(new Error('sensitive-exception-message'), { code: ${JSON.stringify(code)} }); };
       syncBuiltinESMExports();`;
     await assert.rejects(
-      execute(process.execPath, [
-        '--import',
-        `data:text/javascript,${encodeURIComponent(preload)}`,
-        helper,
-        f.path,
-      ]),
+      execute(
+        process.execPath,
+        [
+          '--import',
+          `data:text/javascript,${encodeURIComponent(preload)}`,
+          helper,
+          f.path,
+        ],
+        { env: {} },
+      ),
       {
         code: 1,
         stdout: '',
@@ -72,12 +79,16 @@ test('vault socket preparation accepts a fresh private volume', async (t) => {
 
 test('vault socket preparation removes only a confirmed stale Unix socket', async (t) => {
   const f = await fixture(t);
-  await execute(process.execPath, [
-    '--input-type=module',
-    '-e',
-    "import { createServer } from 'node:net'; createServer().listen(process.argv[1], () => process.exit(0));",
-    f.path,
-  ]);
+  await execute(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      "import { createServer } from 'node:net'; createServer().listen(process.argv[1], () => process.exit(0));",
+      f.path,
+    ],
+    { env: {} },
+  );
   assert((await lstat(f.path)).isSocket());
   await prepareBwSocket(f.path);
   await assert.rejects(lstat(f.path), { code: 'ENOENT' });

@@ -1,0 +1,11 @@
+{
+  "entries": [
+    {
+      "id": "GHSA-86w9-cpqp-85rv",
+      "package": "node-forge",
+      "target": "docker/bw",
+      "reason": "No patched node-forge release exists. The CLI uses node-forge only for AES, HMAC and hashes, not RSA PKCS#1 v1.5 signature verification; bw serve has no published port.",
+      "expires": "2027-01-19"
+    }
+  ]
+}

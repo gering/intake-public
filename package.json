@@ -18,6 +18,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "node --test",
+    "audit:check": "node scripts/audit-check.js",
     "verify": "npm run lint && npm run format:check && npm test"
   },
   "dependencies": {

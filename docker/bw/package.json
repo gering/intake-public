@@ -5,7 +5,7 @@
   "description": "Locked Bitwarden CLI dependencies for the vault image",
   "license": "MIT",
   "dependencies": {
-    "@bitwarden/cli": "2026.9.1"
+    "@bitwarden/cli": "2026.10.0"
   },
   "overrides": {
     "@bitwarden/cli": {

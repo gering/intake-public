@@ -174,16 +174,21 @@ the shared database directly.
    an optimization; the writer also
    polls SQLite, so a missed wake-up does not lose accepted work. The socket
    carries only the ticket ID, not the value or ciphertext.
-7. Before claiming pending work, the production writer checks the local vault's
-   non-mutating `/status` operation. An unavailable/locked API leaves the ticket,
-   ciphertext, and private key pending for a later poll; terminal notification
-   work remains independent. The writer then claims `pending` as `processing`
-   before decrypting or making any vault sync/write request. Sync failures and
-   item-connect failures proven to send nothing return to `pending`, keeping
-   ciphertext/private keys with persisted exponential backoff. An ambiguous item
-   request becomes nonterminal `unknown`, retaining the envelope and key without
-   sending mail. A later writer run waits for persisted settle/backoff, then
-   synchronizes and looks up the exact ticket marker plus the expected fingerprint
+7. The writer atomically claims due `pending` work as `processing`, reads its
+   private metadata, rejects private revocation, and latches its first-seen time.
+   First sight later than private expiry plus the grace period (15 minutes by
+   default) fails as `ticket_expired`. Only then does the production writer check
+   the local vault's non-mutating `/status`, before decrypting or making any vault
+   sync/write request. An unavailable/locked API returns the claimed ticket to
+   `pending` with `failure_code=vault_unavailable`, increments persisted `attempts`,
+   and schedules exponential backoff, retaining ciphertext and the private key.
+   Timely first sight preserves later retries even after expiry; terminal
+   notification work remains independent. Sync failures and item-connect failures
+   proven to send nothing also return to `pending` with persisted backoff. An
+   ambiguous item request becomes nonterminal `unknown`, retaining the envelope
+   and key without sending mail. A later writer run waits for persisted
+   settle/backoff, then synchronizes and looks up the exact ticket marker plus the
+   expected fingerprint
    before deciding whether a create is needed (see crash recovery below). It
    validates plaintext without silently changing it: when `trim=true`,
    a value that is not already trimmed or is empty after applying the policy is
@@ -269,10 +274,12 @@ completion notification reports the fingerprint after a successful vault write.
 
 ### Crash recovery and ambiguous vault writes
 
-**Provably pre-delivery initial failures stay `pending`.** A failed/locked
-`/status` preflight leaves work pending, and a failed initial `/sync` moves claimed
-work back to pending: no item request has started. Item request `ECONNREFUSED`,
-`ENOENT`, `EACCES`, or `ECONNRESET` is retryable only when a fresh socket was
+**Provably pre-delivery initial failures return to `pending`.** A failed/locked
+`/status` preflight returns already-claimed work to pending with
+`failure_code=vault_unavailable`, an incremented retry counter and persisted
+backoff. A failed initial `/sync` also requeues claimed work: no item request has
+started. Item request `ECONNREFUSED`, `ENOENT`, `EACCES`, or `ECONNRESET` is
+retryable only when a fresh socket was
 observed connecting and never emitted `connect`. Connections are not reused.
 Neither `bytesWritten` (which includes buffered writes) nor an unfinished request
 proves zero delivery. `VaultError`'s ambiguous flag is reserved for failures of
@@ -280,9 +287,9 @@ an actual item POST: **every such error is ambiguous unless pre-delivery is
 proven**. Examples include timeout after send, reset after connection/flush,
 malformed or invalid 2xx response (including a missing item ID), oversized
 response, and any non-2xx response, including **HTTP 4xx/400** or 5xx. The pinned
-CLI's [`createWithServer` error handler](https://github.com/bitwarden/clients/blob/cli-v2026.9.1/apps/cli/src/vault/create.command.ts)
+CLI's [`createWithServer` error handler](https://github.com/bitwarden/clients/blob/cli-v2026.10.0/apps/cli/src/vault/create.command.ts)
 converts caught failures to `Response.error`, and
-[`bw serve` maps failed command responses to HTTP 400](https://github.com/bitwarden/clients/blob/cli-v2026.9.1/apps/cli/src/oss-serve-configurator.ts#L443-L454).
+[`bw serve` maps failed command responses to HTTP 400](https://github.com/bitwarden/clients/blob/cli-v2026.10.0/apps/cli/src/oss-serve-configurator.ts#L451-L461).
 An HTTP 4xx response therefore does **not** prove that no item was written and
 must not terminal-fail an actual item POST. These errors become `unknown`, retain
 envelope/key, and are not immediately re-POSTed. Adapter validation that fails
@@ -298,11 +305,25 @@ failure mail is sent until a terminal transition.
 
 Retry scheduling uses persisted `attempts` and `next_attempt_at` in shared
 SQLite, initialized to zero for old rows without changing their lifecycle. The
-exponential backoff is `min(max, base * 2^(attempts-1))`, defaulting to
-**5 seconds, 10 seconds, 20 seconds, ... up to 5 minutes**. Configure writer-only
+exponential backoff is `min(max, base * 2^previousAttempts)`, using the counter
+before incrementing it and defaulting to **5 seconds, 10 seconds, 20 seconds, ...
+up to 5 minutes**. Configure writer-only
 `INTAKE_VAULT_RETRY_BASE_MS` / `INTAKE_VAULT_RETRY_MAX_MS` (positive integer
 milliseconds, base <= max <= 2,147,483,647). The counter saturates at 31; delay
-stays capped indefinitely. Pre-delivery pending retries use this backoff.
+stays capped indefinitely. Failed readiness checks, pre-delivery retries and
+`unknown` retries/recovery increment this counter; claiming work alone does not.
+Readiness and other pre-delivery pending retries use this backoff.
+`database_busy` means local SQLite contention, not a vault rejection; ticket
+material and the key are kept, and normal retry timers apply.
+Other local errors (e.g. SQLite) before an `unknown` ticket's recovery lookup keep
+it `unknown` with `writer_state_failed` and normal backoff, retaining envelope/key;
+deterministic metadata, payload, revocation, expiry, and decryption/parse failures
+(corrupt key, envelope, or stored metadata) remain terminal.
+For a pending ticket, other local errors before the vault write is attempted (for
+example SQLite I/O errors) are retried with `writer_state_failed` and normal
+backoff, keeping envelope and key. SQLite errors on either path stop the current
+batch so later polls can resume without repeating the same database failure for
+every due ticket.
 Writer-only `INTAKE_STUCK_ATTEMPTS` defaults to **10** and accepts positive safe
 integers **1–31**, so the threshold is reachable before counter saturation. On the
 persisted increment to that exact count, the writer emits `ticket_stuck` once per
@@ -326,11 +347,15 @@ with exponential backoff **only**; they do not renew the settle floor. A new
 ambiguous POST starts a new settle wait.
 
 Both selection and atomic claim enforce the due time, so wake-ups, polling, and
-restarts cannot bypass it. A failed preflight is probed at most once per drain,
-and due work is deferred; terminal notification work still runs independently.
+restarts cannot bypass it. After a failed preflight, the rest of that drain reuses
+its unavailable result rather than probing again. Each due pending ticket is
+still claimed and checked against private first-seen expiry; eligible tickets are
+requeued with their own incremented attempts and backoff. Terminal notification
+work runs independently. `unknown` resolution skips `/status` and uses sync plus lookup.
 Actual execution can be later than the scheduled due time by the poll interval
-and other queued work. There is no total-age cutoff: accepted `pending`,
-`processing`, and `unknown` work survives link expiry and is not purgeable.
+and other queued work. Once first seen within private expiry grace, accepted
+`pending`, `processing`, and `unknown` work has no total-age cutoff, survives link
+expiry and is not purgeable.
 Monitor safe error codes, restore vault access, and retain the original master
 and fingerprint keys as well as the ticket databases. Invalid metadata/payloads
 and decryption failures remain terminal, not transient vault failures.
@@ -339,13 +364,13 @@ and decryption failures remain terminal, not transient vault failures.
 unknown-resolution lookup unconditionally performs `POST /sync`, even when
 `BW_SYNC_BEFORE_WRITE=false`, then
 `GET /list/object/items?collectionId=<configured collection id>` **without a
-`search` parameter**. The pinned CLI 2026.9.1's
-[`searchCiphersBasic`](https://github.com/bitwarden/clients/blob/cli-v2026.9.1/libs/common/src/vault/services/search.service.ts#L104-L167)
+`search` parameter**. The pinned CLI 2026.10.0's
+[`searchCiphersBasic`](https://github.com/bitwarden/clients/blob/cli-v2026.10.0/libs/common/src/vault/services/search.service.ts#L104-L167)
 does not search custom fields; a ticket-ID search could miss an existing marker.
 The pinned CLI's successful list response is
 `{"success":true,"data":{"object":"list","data":[...]}}`, as defined by
-[`ListResponse`](https://github.com/bitwarden/clients/blob/cli-v2026.9.1/apps/cli/src/models/response/list.response.ts#L3-L10)
-and [`Response.success`](https://github.com/bitwarden/clients/blob/cli-v2026.9.1/apps/cli/src/models/response.ts#L60-L65).
+[`ListResponse`](https://github.com/bitwarden/clients/blob/cli-v2026.10.0/apps/cli/src/models/response/list.response.ts#L3-L10)
+and [`Response.success`](https://github.com/bitwarden/clients/blob/cli-v2026.10.0/apps/cli/src/models/response.ts#L60-L65).
 The adapter filters the listing strictly in memory: `organizationId` must match,
 `collectionIds` must include the configured collection, at least one ticket marker
 must equal the exact ticket ID, and at least one fingerprint field must exist with
@@ -374,14 +399,18 @@ discarded from memory after filtering.
   **only items for `done` tickets** out of it. Never move unresolved ticket items.
 
 SQLite and the external vault API cannot share a transaction. On writer startup,
-stranded `processing` tickets become `unknown` with a **fresh settle delay** and
-retained envelope/key, not `failed`. The socket rejects work until permissions
-and startup recovery are complete. If database contention prevents recording a
-vault outcome, the serialized writer loop retries local recovery on later polls;
-once storage is available, stranded processing follows the same `unknown`
-transition with a fresh settle delay. Recovery is itself retried while storage
-is unavailable. Both paths eventually perform the lookup above rather than
-blindly replaying a create or deleting the recovery material.
+stranded `processing` tickets become `unknown` with a **fresh settle delay**.
+Their envelope/key is retained for recovery once private first sight has been
+latched within expiry grace, rather than marking them `failed`. If the writer
+dies after the claim commits but before first sight is latched, and restarts
+after private expiry plus grace, the unseen key can be pruned and the ticket
+ends as `ticket_expired`. The socket rejects work until permissions and startup
+recovery are complete. If database contention prevents recording a vault outcome,
+the serialized writer loop retries local recovery on later polls; once storage
+is available, stranded processing follows the same `unknown` transition with a
+fresh settle delay. Recovery is itself retried while storage is unavailable.
+With timely first sight, both paths eventually perform the lookup above rather
+than blindly replaying a create or deleting the recovery material.
 
 **Residual duplicate risk remains.** A timed-out create can finish after the
 settle interval, or the vault server can apply it after the recovery sync. An
@@ -397,9 +426,10 @@ the collection lookup and can cause another create; humans must move entries
 **only after the corresponding ticket is `done`**. Never reactivate a consumed
 ticket in SQLite or create a replacement without inspecting the existing markers.
 
-Unclaimed `pending` work survives a restart and is processed normally, even if
-its original link has since expired. Expiry controls accepting a submission,
-not canceling already accepted work. An interrupted mail send can be retried on
+Unclaimed `pending` work survives a restart, but the writer must first see it
+within its private expiry grace. Work first seen too late fails as
+`ticket_expired`, even if submitted before link expiry; timely first sight lets
+later retries continue after expiry. An interrupted mail send can be retried on
 restart: notifications are **at least once**, and a crash after API acceptance
 but before recording `sent` can cause a duplicate email.
 
@@ -544,39 +574,48 @@ Use a Linux Docker Engine with Compose v2 or newer, local named-volume storage
 suitable for SQLite WAL, and an existing trusted HTTPS tunnel connector. This
 stack can run next to an existing Vaultwarden server; it does not deploy or expose
 the vault server itself. The images pin Node `22.23.3-bookworm-slim` by digest and
-`@bitwarden/cli@2026.9.1`. The bw build installs from committed
+`@bitwarden/cli@2026.10.0`. The bw build installs from committed
 `docker/bw/package.json` and `package-lock.json` with
 `npm ci --omit=dev --ignore-scripts`, including integrity-locked transitive
 dependencies; it copies the complete installed tree into the runtime image.
 The pinned CLI tree has no native addons; its only dependency lifecycle script
-prints a core-js banner. The separate app install keeps scripts enabled for
-`better-sqlite3`. Native build tools and development dependencies stay in build
-stages, not runtime images. No credentials are build arguments or image
-contents; `.dockerignore` excludes secrets, environment files, data, tests, and
-nested local `node_modules`, but retains the bw manifests.
+prints a core-js banner. The locked app dependency `better-sqlite3` 13.0.3 bundles
+Linux x64/arm64 glibc prebuilds using Node-API 10, compatible with the pinned Node
+22 and Bookworm runtime. It has no explicit `install` script or `prebuild-install`
+download, but its `binding.gyp` triggers npm's implicit `node-gyp rebuild` install
+step unless scripts are ignored. The app dependency stage therefore also uses
+`npm ci --omit=dev --ignore-scripts`. Neither dependency stage installs a compiler
+toolchain. The app dependency stage smoke-tests opening SQLite during the image
+build to ensure the bundled prebuild actually loads; development dependencies
+stay out of runtime images. Recheck prebuild/platform compatibility when updating
+the lockfile or base image. No credentials are build arguments or image contents;
+`.dockerignore` excludes secrets, environment files, data, tests, and nested local
+`node_modules`, but retains the bw manifests.
 
-A lockfile provides reproducibility, not a clean security audit. On 2026-10-18,
-`npm audit` in `docker/bw` reported **6 vulnerable package entries (4 high, 2 low)**
-for the unmodified CLI 2026.9.1 tree, inherited through `multer`, `node-forge`,
-and `inquirer`/`external-editor`/`tmp`. CLI 2026.10.0 does not resolve them
-(it still ships `node-forge` 1.4.0 and `tmp` 0.0.33 and adds a moderate `multer`
-finding), so the image keeps 2026.9.1 and `docker/bw/package.json` declares
-targeted npm `overrides` for the fixable high findings:
+A lockfile provides reproducibility, not a clean security audit. The pinned
+CLI 2026.10.0 still requests `multer` 2.3.0, `node-forge` 1.4.0 and, through
+`inquirer`/`external-editor`, `tmp` 0.0.33. `docker/bw/package.json` retains
+targeted npm `overrides` for the fixable findings:
 
-- `multer` 2.2.0 → 2.4.0, scoped to `@bitwarden/cli` (same major; the CLI and
-  `@koa/multer` use the unchanged public API). This also clears the low
-  `multer` finding.
+- `multer` 2.3.0 → 2.4.0, scoped to `@bitwarden/cli` (same major; the CLI and
+  `@koa/multer` use the unchanged public API). The override also applies to
+  `@koa/multer`'s shared dependency and removes the moderate `multer` advisory.
 - `tmp` 0.0.33 → 0.2.7, scoped to `external-editor`, which only calls
-  `tmpNameSync`. This also clears the low `tmp`, `external-editor`, and
+  `tmpNameSync`. This clears the affected `tmp`, `external-editor`, and
   `inquirer` entries.
 
-With the overrides, `npm audit` reports **2 entries (2 high)**: `node-forge`
-1.4.0 ([GHSA-86w9-cpqp-85rv](https://github.com/advisories/GHSA-86w9-cpqp-85rv),
-no patched release exists) and `@bitwarden/cli`, which depends on it. Both stay
-until upstream publishes a fix. The advisory concerns RSA PKCS#1 v1.5 signature
-verification; the CLI uses node-forge only for AES decryption, HMAC and hashes,
-not for RSA signature verification, and `bw serve` has no published port; the
-writer is the only other service that mounts its private Unix socket.
+On 2026-10-19, with these overrides, `npm audit --package-lock-only` in
+`docker/bw` reports **2 vulnerable package entries (2 high; 0 critical,
+0 moderate, 0 low, 0 info)**: `node-forge` 1.4.0
+([GHSA-86w9-cpqp-85rv](https://github.com/advisories/GHSA-86w9-cpqp-85rv), no
+patched release exists) and its dependent `@bitwarden/cli`. These are one
+underlying advisory, not two separate exceptions. The advisory concerns RSA
+PKCS#1 v1.5 signature verification; the CLI uses node-forge only for AES
+decryption, HMAC and hashes, not for RSA signature verification, and `bw serve`
+has no published port; the writer is the only other service that mounts its
+private Unix socket. CI's dependency audit covers both lockfiles; node-forge is
+a documented, expiring exception scoped to `docker/bw` in
+[`.audit-allowlist.json`](.audit-allowlist.json), expiring on **2027-01-19**.
 The overrides pin versions outside the CLI's exact dependency pins, so
 validate the vault service end to end (login, unlock, item creation in the
 target collection through `bw serve`) after every change to `docker/bw`,
@@ -775,10 +814,14 @@ local unlocked status, not current remote reachability or synchronization.
 Probes print no upstream bodies or secrets. Dependencies gate **Compose-managed startup**, not Docker Engine restarts or
 continuous availability: Docker does not automatically restart an unhealthy
 container or stop writer when bw later becomes unhealthy. The writer independently
-checks local unlocked status before each pending claim, including after a reboot,
-and leaves unclaimed work queued during vault startup/outages. Terminal mail
-still proceeds. Preflight logs `vault_unavailable` once on entry to an outage and
-`vault_available` once on recovery, not on every poll or queued ticket; these
+claims each due pending ticket, checks private revocation, latches first sight and
+enforces private expiry grace before checking local unlocked status, including
+after a reboot. A failed readiness check requeues it as `pending` with
+`failure_code=vault_unavailable`, incremented attempts and persisted backoff,
+retaining ciphertext/key. Timely first sight lets retries survive expiry during
+an outage. Terminal mail still proceeds. Preflight logs `vault_unavailable` once
+on entry to an outage and `vault_available` once on recovery, not on every poll or
+queued ticket; these
 report local readiness, not remote-server availability. Socket preparation errors
 include only a safe internal/system code, never paths or exception messages.
 Sync/refresh failures before the item request and proven
@@ -891,6 +934,8 @@ inspection with `show`: check the failure code, vault credentials, collection
 permissions, and connectivity. Persistent 400/403 responses still retry with
 capped backoff; fix their cause rather than deleting recovery material or
 reactivating the ticket. The warning is diagnostic, not a retry limit.
+For `database_busy`, check local SQLite contention rather than vault permissions;
+ticket material and the key are kept for the normal retry timers.
 Compare completion mail, the CLI summary, and vault reference fields as described
 below. `revoke`, `notify-retry`, and `purge` retain their existing safety limits.
 If the writer is down for more than the **15-minute** grace after a ticket's
@@ -1504,8 +1549,8 @@ intake list
 # Set TICKET_ID to the id shown by list, not the complete link/token.
 TICKET_ID=REPLACE_WITH_TICKET_ID
 intake show -- "$TICKET_ID"
-intake revoke "$TICKET_ID"
-intake notify-retry "$TICKET_ID"
+intake revoke -- "$TICKET_ID"
+intake notify-retry -- "$TICKET_ID"
 ```
 
 - `list` prints ID, key name, lifecycle status (including unresolved `unknown`),
@@ -1627,7 +1672,11 @@ before issuing a manual `notify-retry`.
 
 A 2xx response normally counts as API acceptance (`sent`), not final mailbox
 delivery. An explicit nonempty `rejected` response array is instead recorded as
-a permanent failure with safe code `rejected`, even on 2xx.
+a permanent failure with safe code `rejected`, even on 2xx. Success response bodies
+are capped at **16 KiB**; exceeding this byte cap records `notify_status=failed`
+with safe code `response_too_large` and is **not retried automatically**. A 2xx
+response may already mean the mail was accepted, so investigate before making a
+deliberate manual retry to avoid duplicate mail.
 The default timeout is 10 seconds **per attempt**. There are at most two retries
 (three total attempts per delivery cycle), with default 1- and 3-second backoffs,
 only for network failures, timeouts, HTTP 429, and HTTP 5xx. All other 4xx
@@ -1635,9 +1684,20 @@ responses are permanent failures for that cycle and retain `http_<status>`
 (e.g. `http_422`, or `http_403` for an unrecognized 403 code); only the recognized
 403 cases above use their named safe codes. Other short error codes include
 `http_503` and `timeout`. A manual retry creates a new delivery cycle; attempt
-counts accumulate. Startup recovers outstanding pending notifications, not
-terminal failed notifications; mail can be duplicated across a crash, as
-described above.
+counts accumulate. A single notification worker delivers the persisted pending
+queue independently of ticket processing, so slow mail does not delay vault work.
+Shutdown stops new vault work and notification deliveries without draining the
+backlog. It waits up to `INTAKE_SHUTDOWN_WAIT_MS` (default **5000 ms**) for the
+in-flight delivery to settle and records its result normally. `0` cancels
+immediately. Anything unfinished at the deadline is cancelled, stays pending,
+and is re-sent after restart; late results are ignored. Startup recovers pending
+notifications, not terminal failed notifications. Delivery remains **at least
+once**: mail can be duplicated after a crash or an interrupted shutdown.
+Keep this wait well below the container stop grace period (Compose writer
+`stop_grace_period: 90s`) and below the per-attempt `MAIL_API_TIMEOUT_MS` budget
+(default **10000 ms**). It is not a budget for all three attempts and backoffs;
+reserve time for in-flight vault work and process cleanup within the stop grace
+period.
 
 The writer will not start without mail configuration unless
 `INTAKE_NOTIFY=off` is explicitly chosen. That development escape hatch does
@@ -1660,8 +1720,9 @@ The loader rejects multiline secret values and unsafe secret-file permissions.
 All numeric settings below are positive safe integers unless stated otherwise.
 Millisecond timer settings (`INTAKE_RATE_WINDOW_MS`, `INTAKE_POLL_MS`,
 `INTAKE_IPC_TIMEOUT_MS`, `MAIL_API_TIMEOUT_MS`, both `MAIL_API_RETRY_DELAY_*_MS`
-settings, `BW_TIMEOUT_MS`, both `INTAKE_VAULT_RETRY_*_MS` settings, and
-`INTAKE_UNKNOWN_SETTLE_MS`) must also be at most **2,147,483,647**, avoiding
+settings, `BW_TIMEOUT_MS`, both `INTAKE_VAULT_RETRY_*_MS` settings,
+`INTAKE_UNKNOWN_SETTLE_MS`, and `INTAKE_SHUTDOWN_WAIT_MS`) must also be at most
+**2,147,483,647**, avoiding
 Node timer clamping. Boolean settings accept `true`, `false`, `1`, or `0`. `INTAKE_NOTIFY` instead
 accepts exactly `on` or `off`. Durations use positive whole-number `m`, `h`, or
 `d` units. Configuration is read at process startup, not hot-reloaded.
@@ -1693,7 +1754,7 @@ without loading configuration (but still refuse root).
 | `INTAKE_RATE_WINDOW_MS`          | `60000`                                  | Fixed rate-limit window in milliseconds                                                                                                            |
 | `INTAKE_RATE_IP_LIMIT`           | `30`                                     | Per-client allowance for open/submit requests; IPv6 uses /64 plus an additional /48 bucket                                                         |
 | `INTAKE_RATE_IPV6_48_LIMIT`      | `4 × INTAKE_RATE_IP_LIMIT` (`120`)       | Additional allowance shared across native IPv6 clients in the same /48                                                                             |
-| `INTAKE_RATE_TICKET_LIMIT`       | `10`                                     | Counts failed token verifications per ticket for open/submit requests                                                                              |
+| `INTAKE_RATE_TICKET_LIMIT`       | `10`                                     | Failed token verifications per ticket for open/submit; valid tokens bypass this limit, not client limits                                           |
 | `INTAKE_RATE_MAX_ENTRIES`        | `10000`                                  | Client and ticket buckets use separate maps, each bounded by this limit (minimum 2); expired-first, then LRU eviction                              |
 | `INTAKE_IPC_TIMEOUT_MS`          | `45000`                                  | Unix-socket request timeout in milliseconds for wake-up/manual notification retry                                                                  |
 | `INTAKE_POLL_MS`                 | `1000`                                   | Writer's periodic durable queue scan interval in milliseconds                                                                                      |
@@ -1709,14 +1770,12 @@ The `/48` allowance defaults to four times the configured per-client allowance.
 Per-ticket limits count failed token verifications across client addresses, not
 successful opens or submissions. Bad tokens, unknown tickets and unavailable
 tickets consume this allowance; malformed envelopes and internal errors do not.
-After the allowance is exhausted, all requests for that ticket ID return 429 until
-the fixed window expires, including requests carrying the valid token. Only
-someone who knows the ticket ID can trigger this lockout. The ID is part of the
-link itself (`#req=<id>.<secret>`), so anyone who received the link knows it;
-IDs also appear in CLI output, logs and notification mail but are not public. It
-lasts at most one rate window; wait for the window to expire, or revoke the
-ticket and issue a new one. Client limits are charged before the body is read,
-including malformed or oversized bodies.
+After the allowance is exhausted, wrong or unavailable tokens for that ticket ID
+return 429 until the fixed window expires. A valid token for an active, unexpired
+ticket bypasses this per-ticket block, so knowing only an ID cannot lock out its
+holder. Expired, consumed and revoked tickets do not qualify for the bypass.
+Per-client limits still apply to valid tokens and are charged before the body is
+read, including malformed or oversized bodies.
 
 Client and ticket buckets are stored in separate bounded maps, each with capacity
 `INTAKE_RATE_MAX_ENTRIES`. Capacity must be at least **2** so both native IPv6
@@ -1753,6 +1812,7 @@ require mail or vault environment settings. `list`, `show`, `revoke`, and
 | ----------------------------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `INTAKE_FINGERPRINT_KEY_FILE` | Required, no direct value alternative    | Writer-owned `0600` file containing an independent base64 32-byte HMAC key                           |
 | `INTAKE_NOTIFY`               | `on`                                     | Required mail behavior; `off` explicitly disables sending for development                            |
+| `INTAKE_SHUTDOWN_WAIT_MS`     | `5000`                                   | In-flight notification shutdown wait; safe integer 0–2147483647 ms; 0 cancels immediately            |
 | `MAIL_API_URL`                | Required when notifications are on       | Mail API base URL; HTTPS required except loopback HTTP development                                   |
 | `MAIL_API_TOKEN_FILE`         | Required unless direct token is supplied | Writer-only `0600` bearer credential file                                                            |
 | `MAIL_API_TOKEN`              | Unset                                    | Direct mail bearer token alternative                                                                 |
@@ -1844,6 +1904,26 @@ single-use behavior, queueing while the writer is stopped, restart recovery,
 notification failure/retry, actual CLI/API item mapping, and reverse-proxy header
 handling. Test the hardening and readiness policy on the target system; passing
 unit tests alone does not validate the deployed network/permission boundary.
+
+### Security checks
+
+Run `npm run audit:check` with Node 22 to audit both the root and `docker/bw`
+lockfiles without installing their dependencies. The dependency audit
+also runs in CI on pull requests, pushes to `main`, weekly, and on manual
+request. Unapproved high/critical advisories, expired exceptions, invalid
+allowlists and incomplete audit responses fail the check; lower severities are
+reported, and stale exceptions produce warnings.
+
+Grant exceptions only through a reviewed PR to `.audit-allowlist.json`. Each
+entry requires the exact GHSA `id`, npm `package`, `target` (`root` or
+`docker/bw`), a factual non-placeholder `reason`, and an `expires` date in
+`YYYY-MM-DD` format. An exception applies only to that target, advisory and
+package; remove it when no longer needed and review it before expiry.
+
+CI also runs Gitleaks with `.gitleaks.toml` to scan for secrets, with fully
+redacted output. Any fixture or documentation exclusion must be narrow,
+commented and reviewed; never allowlist real credentials. Dependabot checks
+GitHub Actions and both npm trees weekly.
 
 ## License
 

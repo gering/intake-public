@@ -18,7 +18,11 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import Database from 'better-sqlite3';
 import { PrivateKeyStore, TicketStore } from '../src/db.js';
-import { openDatabase, validateDatabaseSchema } from '../src/db-open.js';
+import {
+  databaseFailure,
+  openDatabase,
+  validateDatabaseSchema,
+} from '../src/db-open.js';
 import { IntakeError } from '../src/errors.js';
 import { fixture as ticketFixture } from '../support/fixtures.js';
 
@@ -501,21 +505,208 @@ test('a busy error while opening is database_unavailable and closes SQLite', (t)
   assert.equal(opened.open, false);
 });
 
-test('non-lock SQLite failures stay unsafe_database', (t) => {
-  const { path } = fixture(t);
-  let opened;
-  const exec = t.mock.method(Database.prototype, 'exec', function () {
-    opened = this;
-    throw new Database.SqliteError(
-      'database disk image is malformed',
-      'SQLITE_CORRUPT',
-    );
+const resourceFsCodes = ['ENOSPC', 'EMFILE', 'ENFILE', 'EROFS', 'EIO'];
+const resourceSqliteCodes = [
+  'SQLITE_FULL',
+  'SQLITE_IOERR',
+  'SQLITE_IOERR_READ',
+  'SQLITE_IOERR_WRITE',
+  'SQLITE_IOERR_FSYNC',
+  'SQLITE_IOERR_SHMOPEN',
+  'SQLITE_CANTOPEN',
+  'SQLITE_CANTOPEN_FULLPATH',
+  'SQLITE_NOMEM',
+  'SQLITE_READONLY',
+  'SQLITE_READONLY_RECOVERY',
+  'SQLITE_READONLY_DIRECTORY',
+];
+
+for (const code of resourceFsCodes) {
+  test(`${code} while creating a database is database_io_error`, (t) => {
+    const { path } = fixture(t);
+    const originalOpen = fs.openSync;
+    const mock = t.mock.method(fs, 'openSync', (target, ...args) => {
+      if (target === path)
+        throw Object.assign(new Error('fixture filesystem details'), { code });
+      return originalOpen(target, ...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      unsafe(() => openDatabase(path, 0o660, ['tickets']), 'database_io_error');
+      assert.equal(existsSync(path), false);
+    } finally {
+      mock.mock.restore();
+      syncBuiltinESMExports();
+    }
   });
-  try {
-    unsafe(() => new TicketStore(path));
-    assert.equal(opened.open, false);
-  } finally {
-    exec.mock.restore();
+
+  test(`${code} during identity validation is database_io_error and closes SQLite`, (t) => {
+    const { path } = fixture(t);
+    const originalStat = fs.lstatSync;
+    let opened;
+    const stat = t.mock.method(fs, 'lstatSync', (target, ...args) => {
+      if (opened && target === path)
+        throw Object.assign(new Error('fixture filesystem details'), { code });
+      return originalStat(target, ...args);
+    });
+    syncBuiltinESMExports();
+    withPragmaMock(t, function (source, run) {
+      opened = this;
+      return run();
+    });
+    try {
+      unsafe(() => openDatabase(path, 0o660, ['tickets']), 'database_io_error');
+      assert.equal(opened.open, false);
+    } finally {
+      stat.mock.restore();
+      syncBuiltinESMExports();
+    }
+  });
+}
+
+for (const code of resourceSqliteCodes) {
+  test(`${code} while opening is database_io_error and closes SQLite`, (t) => {
+    for (const stage of [
+      'trusted_schema = OFF',
+      'database_list',
+      'quick_check',
+      'journal_mode = WAL',
+    ]) {
+      const { path } = fixture(t);
+      let opened;
+      const mock = withPragmaMock(t, function (source, run) {
+        if (source === stage) {
+          opened = this;
+          throw new Database.SqliteError('fixture SQLite details', code);
+        }
+        return run();
+      });
+      try {
+        unsafe(
+          () => openDatabase(path, 0o660, ['tickets']),
+          'database_io_error',
+        );
+        assert.equal(opened.open, false);
+      } finally {
+        mock.mock.restore();
+      }
+    }
+  });
+
+  test(`${code} during migration is database_io_error and closes both stores`, (t) => {
+    for (const Store of [TicketStore, PrivateKeyStore]) {
+      const { path } = fixture(t);
+      let opened;
+      const exec = t.mock.method(Database.prototype, 'exec', function () {
+        opened = this;
+        throw new Database.SqliteError('fixture SQLite details', code);
+      });
+      try {
+        unsafe(() => new Store(path), 'database_io_error');
+        assert.equal(opened.open, false);
+      } finally {
+        exec.mock.restore();
+      }
+    }
+  });
+}
+
+test('resource errors during schema validation close SQLite and hide details', (t) => {
+  for (const code of resourceSqliteCodes) {
+    const db = openDatabase(':memory:', 0o660, ['tickets']);
+    t.mock.method(db, 'prepare', () => {
+      throw new Database.SqliteError('fixture SQLite details', code);
+    });
+    unsafe(() => validateDatabaseSchema(db, ['tickets']), 'database_io_error');
+    assert.equal(db.open, false);
+  }
+});
+
+test('database failure classification preserves known IntakeErrors and rejects unknown errors', () => {
+  for (const code of [
+    'unsafe_database',
+    'unsafe_database_permissions',
+    'database_unavailable',
+    'database_io_error',
+  ]) {
+    const error = new IntakeError(code);
+    assert.equal(databaseFailure(error), error);
+  }
+  for (const error of [
+    new Error('fixture unexpected error'),
+    new IntakeError('SQLITE_IOERR'),
+    { code: 'SQLITE_IOERR' },
+    Object.assign(new Error('fixture invalid code'), {
+      code: 'SQLITE_IOERROR',
+    }),
+    Object.assign(new Error('fixture invalid code'), {
+      code: 'SQLITE_READONLYX',
+    }),
+    Object.assign(new Error('fixture invalid code'), {
+      code: 'SQLITE_CANTOPENX',
+    }),
+  ]) {
+    const failure = databaseFailure(error);
+    assert.ok(failure instanceof IntakeError);
+    assert.equal(failure.code, 'unsafe_database');
+    assert.equal(failure.message, 'unsafe_database');
+  }
+});
+
+for (const code of [
+  'SQLITE_READONLY_DBMOVED',
+  'SQLITE_CANTOPEN_SYMLINK',
+  'SQLITE_CANTOPEN_DIRTYWAL',
+]) {
+  test(`${code} maps to unsafe_database via databaseFailure`, () => {
+    const error = new Database.SqliteError('fixture identity details', code);
+    const failure = databaseFailure(error);
+    assert.ok(failure instanceof IntakeError);
+    assert.equal(failure.code, 'unsafe_database');
+    assert.equal(failure.message, 'unsafe_database');
+  });
+
+  test(`${code} during identity validation is unsafe_database and closes SQLite`, (t) => {
+    for (const stage of [1, 2]) {
+      const { path } = fixture(t);
+      let checks = 0;
+      let opened;
+      const mock = withPragmaMock(t, function (source, run) {
+        if (source === 'database_list' && ++checks === stage) {
+          opened = this;
+          throw new Database.SqliteError('fixture identity details', code);
+        }
+        return run();
+      });
+      try {
+        unsafe(() => openDatabase(path, 0o660, ['tickets']));
+        assert.equal(checks, stage);
+        assert.equal(opened.open, false);
+      } finally {
+        mock.mock.restore();
+      }
+    }
+  });
+}
+
+test('corrupt and non-database SQLite failures stay unsafe_database', (t) => {
+  for (const code of [
+    'SQLITE_CORRUPT',
+    'SQLITE_CORRUPT_VTAB',
+    'SQLITE_NOTADB',
+  ]) {
+    const { path } = fixture(t);
+    let opened;
+    const exec = t.mock.method(Database.prototype, 'exec', function () {
+      opened = this;
+      throw new Database.SqliteError('fixture corruption details', code);
+    });
+    try {
+      unsafe(() => new TicketStore(path));
+      assert.equal(opened.open, false);
+    } finally {
+      exec.mock.restore();
+    }
   }
 });
 

@@ -38,12 +38,16 @@ test('writer socket preparation accepts only its owned shared directory without 
 
 test('writer socket preparation recovers an uncleanly stopped listener before rebinding', async (t) => {
   const f = await fixture(t);
-  await execute(process.execPath, [
-    '--input-type=module',
-    '-e',
-    "import { createServer } from 'node:net'; createServer().listen(process.argv[1], () => process.exit(0));",
-    f.path,
-  ]);
+  await execute(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      "import { createServer } from 'node:net'; createServer().listen(process.argv[1], () => process.exit(0));",
+      f.path,
+    ],
+    { env: {} },
+  );
   assert((await lstat(f.path)).isSocket());
   await prepareWriterSocket(f.path);
   const server = createServer();
@@ -92,7 +96,6 @@ exec "$REAL_NODE" "$SOCKET_HELPER" "$2" "$3"
     { mode: 0o700 },
   );
   const env = {
-    ...process.env,
     PATH: `${f.dir}:${process.env.PATH}`,
     REAL_NODE: process.execPath,
     SOCKET_HELPER: new URL('../docker/prepare-bw-socket.js', import.meta.url)

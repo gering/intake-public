@@ -242,6 +242,10 @@ for (const [name, body] of [
     `{"error":"recipient_not_allowed","message":"${privateValue}`,
   ],
   ['null', 'null'],
+  [
+    'UTF-8 BOM',
+    String.fromCharCode(0xfeff) + '{"error":"recipient_not_allowed"}',
+  ],
   ['array', JSON.stringify([{ error: 'recipient_not_allowed' }])],
   ['unknown code', JSON.stringify({ error: `arbitrary_${privateValue}` })],
   [
@@ -401,6 +405,37 @@ test('mail times out every attempt without leaking ticket data', async (t) => {
   assertNoSecrets(result);
 });
 
+test('mail cancellation interrupts a retry backoff without another attempt', async (t) => {
+  const attempted = Promise.withResolvers();
+  const fetch = t.mock.method(globalThis, 'fetch', async () => {
+    attempted.resolve();
+    return new Response('', { status: 503 });
+  });
+  const controller = new AbortController();
+  const delivering = notifier('https://mail.example.com', {
+    backoffMs: [60000, 60000],
+  }).send(ticket(), { signal: controller.signal });
+  const rejected = assert.rejects(delivering, { name: 'AbortError' });
+  await attempted.promise;
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  await rejected;
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+test('mail cancellation before sending does not make an HTTP request', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', () => {
+    assert.fail('Cancelled delivery must not start');
+  });
+  await assert.rejects(
+    notifier('https://mail.example.com').send(ticket(), {
+      signal: AbortSignal.abort(),
+    }),
+    { name: 'AbortError' },
+  );
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
 test('mail timeout also covers reading the successful response body', async (t) => {
   const server = await mailServer(t, (_request, response) => {
     response.writeHead(200, { 'Content-Type': 'application/json' });
@@ -425,6 +460,30 @@ test('mail treats a nonempty rejected list as a permanent failure', async (t) =>
     notifiedAt: null,
   });
   assert.equal(server.requests.length, 1);
+});
+
+test('mail treats a rejected list after a UTF-8 BOM split across chunks as a permanent failure', async (t) => {
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(Uint8Array.of(0xef));
+      controller.enqueue(Uint8Array.of(0xbb));
+      controller.enqueue(Uint8Array.of(0xbf));
+      controller.enqueue(Buffer.from('{"rejected":["ops@example.com"]}'));
+      controller.close();
+    },
+  });
+  const fetch = t.mock.method(
+    globalThis,
+    'fetch',
+    async () => new Response(body, { status: 200 }),
+  );
+  assert.deepEqual(await notifier('https://mail.example.com').send(ticket()), {
+    status: 'failed',
+    attempts: 1,
+    error: 'rejected',
+    notifiedAt: null,
+  });
+  assert.equal(fetch.mock.callCount(), 1);
 });
 
 for (const status of [201, 202, 204]) {
@@ -545,4 +604,103 @@ test('mail validates configuration without exposing invalid URLs or tokens', () 
       },
     );
   }
+});
+
+test('mail fails closed on a successful response over 16 KiB without leaking or logging data', async (t) => {
+  const input = ticket();
+  const original = structuredClone(input);
+  const body = JSON.stringify({ rejected: [], detail: input, token: apiToken });
+  const text = body.padEnd(16 * 1024 + 1, ' ');
+  const server = await mailServer(t, (_request, response) => {
+    response.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(text),
+    });
+    response.end(text);
+  });
+  const logs = [];
+  for (const method of ['log', 'info', 'debug', 'warn', 'error']) {
+    t.mock.method(console, method, (...args) => logs.push(args));
+  }
+  const result = await notifier(server.url).send(input);
+  assert.deepEqual(result, {
+    status: 'failed',
+    attempts: 1,
+    error: 'response_too_large',
+    notifiedAt: null,
+  });
+  assert.equal(server.requests.length, 1);
+  assert.deepEqual(input, original);
+  assertNoSecrets(result);
+  assert.deepEqual(logs, []);
+});
+
+test('mail cancels an oversized successful stream without a content length', async (t) => {
+  let reads = 0;
+  let cancelled = false;
+  const body = new ReadableStream(
+    {
+      pull(controller) {
+        reads += 1;
+        controller.enqueue(
+          Buffer.from(
+            (reads === 1 ? JSON.stringify(ticket()) : '').padEnd(4096, ' '),
+          ),
+        );
+      },
+      cancel() {
+        cancelled = true;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const response = new Response(body);
+  assert.equal(response.headers.has('content-length'), false);
+  const fetch = t.mock.method(globalThis, 'fetch', async () => response);
+  const result = await notifier('https://mail.example.com').send(ticket());
+  assert.deepEqual(result, {
+    status: 'failed',
+    attempts: 1,
+    error: 'response_too_large',
+    notifiedAt: null,
+  });
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(reads, 5);
+  assert.equal(cancelled, true);
+  assertNoSecrets(result);
+});
+
+test('mail accepts a successful response at the 16 KiB byte limit', async (t) => {
+  const body = JSON.stringify({ rejected: [], message: 'é' });
+  const text = body + ' '.repeat(16 * 1024 - Buffer.byteLength(body));
+  assert.equal(Buffer.byteLength(text), 16 * 1024);
+  const server = await mailServer(t, (_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(text);
+  });
+  const result = await notifier(server.url).send(ticket());
+  assert.equal(result.status, 'sent');
+  assert.equal(result.attempts, 1);
+  assert.equal(result.error, null);
+  assert.equal(server.requests.length, 1);
+});
+
+test('mail timeout covers a successful response stalled at the 16 KiB byte limit', async (t) => {
+  const server = await mailServer(t, (_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.flushHeaders();
+    response.write(' '.repeat(16 * 1024));
+  });
+  const result = await notifier(server.url, {
+    timeoutMs: 100,
+    backoffMs: [],
+  }).send(ticket());
+  assert.deepEqual(result, {
+    status: 'failed',
+    attempts: 1,
+    error: 'timeout',
+    notifiedAt: null,
+  });
+  assert.equal(server.requests.length, 1);
+  assertNoSecrets(result);
 });

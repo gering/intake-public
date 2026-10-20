@@ -25,12 +25,18 @@ function connection(path, mode, tables, migrate) {
 
 function metadata(row) {
   if (!row) return null;
+  let target;
+  try {
+    target = JSON.parse(row.target_json);
+  } catch {
+    throw new IntakeError('ticket_metadata_mismatch');
+  }
   return {
     id: row.id,
     keyName: row.key_name,
     purpose: row.purpose,
     trim: Boolean(row.trim),
-    target: JSON.parse(row.target_json),
+    target,
     notifyEmail: row.notify_email,
     metaDigest: row.meta_digest,
     expiresAt: row.expires_at,
@@ -400,6 +406,14 @@ export class TicketStore {
       )
       .all(now)
       .map(({ id }) => id);
+  }
+
+  nextNotification() {
+    return this.db
+      .prepare(
+        "SELECT id FROM tickets WHERE status IN ('done','failed') AND notify_status = 'pending' ORDER BY created_at LIMIT 1",
+      )
+      .get()?.id;
   }
 
   recordNotification(id, result) {

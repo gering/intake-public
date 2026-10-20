@@ -111,8 +111,6 @@ export async function startWeb({ store, config, logger = createLogger() }) {
           throw new IntakeError('rate_limited', 429);
         const body = await readJson(req, config.bodyLimit ?? 100000);
         id = parseToken(body.token)?.id;
-        if (id && limiter.ticketBlocked(id))
-          throw new IntakeError('rate_limited', 429);
         if (path === '/api/open') {
           const ticket = store.open(body.token);
           json(res, 200, ticket, headers);
@@ -136,10 +134,16 @@ export async function startWeb({ store, config, logger = createLogger() }) {
           );
           json(res, 202, { status: result.status }, headers);
         }
-      } catch (error) {
+      } catch (cause) {
+        let error = cause;
         const known = error instanceof IntakeError;
-        if (known && error.code === 'ticket_unavailable' && id)
+        if (known && error.code === 'ticket_unavailable' && id) {
+          // Store authorization precedes mutations; throttle only rejected tokens
+          // so knowing an ID cannot block its valid holder or cause side effects.
+          const blocked = limiter.ticketBlocked(id);
           limiter.allowTicketFailure(id);
+          if (blocked) error = new IntakeError('rate_limited', 429);
+        }
         if (!known) logger.info('web_error', { code: 'internal_error' });
         if (known && error.code === 'body_too_large') {
           res.setHeader('Connection', 'close');

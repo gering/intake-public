@@ -27,6 +27,7 @@ try {
     notifyOff: config.notifyOff,
     socketPath: config.socketPath,
     pollMs: config.pollMs,
+    shutdownWaitMs: config.shutdownWaitMs,
     retryBaseMs: config.vaultRetryBaseMs,
     retryMaxMs: config.vaultRetryMaxMs,
     unknownSettleMs: config.unknownSettleMs,

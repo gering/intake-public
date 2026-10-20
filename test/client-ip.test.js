@@ -346,7 +346,7 @@ test('minimum capacity retains limits for repeated opens by the same client and 
   }
 });
 
-test('changing the configured IP does not bypass the separate ticket limit', async (t) => {
+test('changing the configured IP does not bypass the ticket limit for wrong tokens', async (t) => {
   const f = await webFixture(t, {
     INTAKE_CLIENT_IP_HEADER: header,
     INTAKE_RATE_IP_LIMIT: '100',
@@ -366,7 +366,7 @@ test('changing the configured IP does not bypass the separate ticket limit', asy
   const second = await post(
     f.base,
     '/api/open',
-    { token },
+    { token: wrongToken },
     { [header]: '192.0.2.11' },
   );
   assert.equal(second.status, 429);

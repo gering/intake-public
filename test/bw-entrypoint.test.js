@@ -69,7 +69,6 @@ printf '%s|%s|%s|%s|%s\\n' "node $*" "\${BW_CLIENTID-unset}" "\${BW_CLIENTSECRET
     { mode: 0o700 },
   );
   const env = {
-    ...process.env,
     PATH: `${dir}:${process.env.PATH}`,
     CALLS: join(dir, 'calls'),
     BW_SERVER: 'https://vault.example.com',

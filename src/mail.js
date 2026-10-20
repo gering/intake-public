@@ -68,20 +68,23 @@ function messageFor(ticket) {
   };
 }
 
+async function readBoundedBody(response, maxBytes) {
+  if (!response.body) return Buffer.alloc(0);
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of response.body) {
+    bytes += chunk.byteLength;
+    if (bytes > maxBytes) return null;
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, bytes);
+}
+
 async function forbiddenError(response) {
   try {
-    if (!response.body) return 'http_403';
-    const chunks = [];
-    let bytes = 0;
     // Only inspect a small 403 body, and expose exact allowlisted codes, never text.
-    for await (const chunk of response.body) {
-      bytes += chunk.byteLength;
-      if (bytes > 4096) return 'http_403';
-      chunks.push(chunk);
-    }
-    const code = JSON.parse(
-      Buffer.concat(chunks, bytes).toString('utf8'),
-    )?.error;
+    const body = await readBoundedBody(response, 4096);
+    const code = JSON.parse(body?.toString('utf8'))?.error;
     if (code === 'recipient_not_allowed') return 'recipient_not_allowed';
     if (code === 'send_not_allowed') return 'send_not_allowed';
   } catch {
@@ -127,7 +130,8 @@ export class MailNotifier {
     this.#backoffMs = backoffMs.slice(0, 2);
   }
 
-  async send(ticket) {
+  async send(ticket, { signal } = {}) {
+    signal?.throwIfAborted();
     let body;
     try {
       // Deliberately do not serialize the ticket, target notes, or envelope.
@@ -142,14 +146,18 @@ export class MailNotifier {
     }
 
     for (let attempt = 0; ; attempt += 1) {
-      const signal = AbortSignal.timeout(this.#timeoutMs);
+      signal?.throwIfAborted();
+      const timeout = AbortSignal.timeout(this.#timeoutMs);
+      const requestSignal = signal
+        ? AbortSignal.any([signal, timeout])
+        : timeout;
       let error;
       let retryable = false;
       try {
         const response = await fetch(this.#url, {
           method: 'POST',
           redirect: 'error',
-          signal,
+          signal: requestSignal,
           headers: {
             Authorization: `Bearer ${this.#token}`,
             'Content-Type': 'application/json',
@@ -157,22 +165,26 @@ export class MailNotifier {
           body,
         });
         if (response.ok) {
-          const text = await response.text();
-          let result;
-          try {
-            result = JSON.parse(text);
-          } catch {
-            // A successful API response need not contain JSON (including 204).
-          }
-          if (Array.isArray(result?.rejected) && result.rejected.length > 0) {
-            error = 'rejected';
+          const responseBody = await readBoundedBody(response, 16 * 1024);
+          if (responseBody === null) {
+            error = 'response_too_large';
           } else {
-            return {
-              status: 'sent',
-              attempts: attempt + 1,
-              error: null,
-              notifiedAt: new Date().toISOString(),
-            };
+            let result;
+            try {
+              result = JSON.parse(new TextDecoder().decode(responseBody));
+            } catch {
+              // A successful API response need not contain JSON (including 204).
+            }
+            if (Array.isArray(result?.rejected) && result.rejected.length > 0) {
+              error = 'rejected';
+            } else {
+              return {
+                status: 'sent',
+                attempts: attempt + 1,
+                error: null,
+                notifiedAt: new Date().toISOString(),
+              };
+            }
           }
         } else {
           error = `http_${response.status}`;
@@ -187,7 +199,8 @@ export class MailNotifier {
           }
         }
       } catch {
-        error = signal.aborted ? 'timeout' : 'network';
+        signal?.throwIfAborted();
+        error = timeout.aborted ? 'timeout' : 'network';
         retryable = true;
       }
 
@@ -199,7 +212,7 @@ export class MailNotifier {
           notifiedAt: null,
         };
       }
-      await sleep(this.#backoffMs[attempt]);
+      await sleep(this.#backoffMs[attempt], undefined, { signal });
     }
   }
 }

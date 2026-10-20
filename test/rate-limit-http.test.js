@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { request } from 'node:http';
 import { createToken } from '../src/tokens.js';
 import { startWeb } from '../src/web.js';
+import { encryptValue } from '../public/crypto.js';
 import { fixture, post } from '../support/fixtures.js';
 
 async function webFixture(t, overrides = {}) {
@@ -18,7 +19,7 @@ async function webFixture(t, overrides = {}) {
 
 test('successful opens never consume the ticket failure allowance', async (t) => {
   const f = await webFixture(t, { ticketLimit: 2, ipLimit: 100 });
-  const { token } = f.create();
+  const { ticket, token } = f.create();
   for (let i = 0; i < 6; i++) {
     const response = await post(
       f.base,
@@ -29,35 +30,128 @@ test('successful opens never consume the ticket failure allowance', async (t) =>
     assert.equal(response.status, 200);
     await response.text();
   }
+  const wrongToken = `${ticket.id}.${createToken(f.config.hmacKey).token.split('.')[1]}`;
+  for (let i = 0; i <= f.config.ticketLimit; i++) {
+    const response = await post(
+      f.base,
+      '/api/open',
+      { token: wrongToken },
+      { 'client-ip': '192.0.2.1' },
+    );
+    const status = i < f.config.ticketLimit ? 400 : 429;
+    assert.equal(response.status, status);
+    assert.deepEqual(await response.json(), {
+      error: status === 429 ? 'rate_limited' : 'ticket_unavailable',
+    });
+  }
+});
+
+test('ticket failure exhaustion blocks wrong tokens but not valid open and submit', async (t) => {
+  const f = await webFixture(t, { ticketLimit: 2, ipLimit: 100 });
+  const { ticket, token } = f.create();
+  const wrongToken = `${ticket.id}.${createToken(f.config.hmacKey).token.split('.')[1]}`;
+  const envelope = await encryptValue(ticket, 'submitted value');
+  for (const [path, status, ip] of [
+    ['/api/open', 400, '192.0.2.1'],
+    ['/api/submit', 400, '192.0.2.2'],
+    ['/api/open', 429, '192.0.2.1'],
+    ['/api/submit', 429, '192.0.2.2'],
+  ]) {
+    const response = await post(
+      f.base,
+      path,
+      { token: wrongToken, envelope },
+      { 'client-ip': ip },
+    );
+    assert.equal(response.status, status);
+    assert.deepEqual(await response.json(), {
+      error: status === 429 ? 'rate_limited' : 'ticket_unavailable',
+    });
+    const stored = f.store.getState(ticket.id);
+    assert.equal(stored.status, 'active');
+    assert.equal(stored.openedAt, null);
+    assert.equal(stored.usedAt, null);
+    assert.equal(stored.envelope, null);
+  }
+  const opened = await post(
+    f.base,
+    '/api/open',
+    { token },
+    { 'client-ip': '192.0.2.3' },
+  );
+  assert.equal(opened.status, 200);
+  assert.equal((await opened.json()).id, ticket.id);
+  const stillBlocked = await post(
+    f.base,
+    '/api/open',
+    { token: wrongToken },
+    { 'client-ip': '192.0.2.1' },
+  );
+  assert.equal(stillBlocked.status, 429);
+  assert.deepEqual(await stillBlocked.json(), { error: 'rate_limited' });
+  const invalidEnvelope = await post(
+    f.base,
+    '/api/submit',
+    { token, envelope: {} },
+    { 'client-ip': '192.0.2.3' },
+  );
+  assert.equal(invalidEnvelope.status, 400);
+  assert.deepEqual(await invalidEnvelope.json(), { error: 'invalid_envelope' });
+  const submitted = await post(
+    f.base,
+    '/api/submit',
+    { token, envelope },
+    { 'client-ip': '192.0.2.3' },
+  );
+  assert.equal(submitted.status, 202);
+  assert.deepEqual(await submitted.json(), { status: 'pending' });
+  assert.equal(f.store.getState(ticket.id).status, 'pending');
+  assert.deepEqual(f.store.getState(ticket.id).envelope, envelope);
 });
 
 for (const path of ['/api/open', '/api/submit']) {
-  test(`${path} counts bad token verifications and then blocks even a valid token`, async (t) => {
-    const f = await webFixture(t, { ticketLimit: 2, ipLimit: 100 });
-    const { token } = f.create();
-    const [id, secret] = token.split('.');
-    const wrongToken = `${id}.${secret[0] === 'A' ? 'B' : 'A'}${secret.slice(1)}`;
-    for (const [attempt, status] of [
-      [wrongToken, 400],
-      [wrongToken, 400],
-      [wrongToken, 429],
-      [token, 429],
-    ]) {
-      const response = await post(
-        f.base,
-        path,
-        { token: attempt, envelope: {} },
-        { 'client-ip': '192.0.2.1' },
-      );
-      assert.equal(response.status, status);
-      assert.deepEqual(await response.json(), {
-        error: status === 429 ? 'rate_limited' : 'ticket_unavailable',
-      });
-    }
+  test(`${path} still applies client limits to a valid token with an exhausted ticket bucket`, async (t) => {
+    const f = await webFixture(t, { ticketLimit: 1, ipLimit: 1 });
+    const { ticket, token } = f.create();
+    const wrongToken = `${ticket.id}.${createToken(f.config.hmacKey).token.split('.')[1]}`;
+    const rejected = await post(
+      f.base,
+      '/api/open',
+      { token: wrongToken },
+      { 'client-ip': '192.0.2.1' },
+    );
+    assert.equal(rejected.status, 400);
+    assert.deepEqual(await rejected.json(), { error: 'ticket_unavailable' });
+    const opened = await post(
+      f.base,
+      '/api/open',
+      { token },
+      { 'client-ip': '192.0.2.2' },
+    );
+    assert.equal(opened.status, 200);
+    await opened.json();
+    const limited = await post(
+      f.base,
+      path,
+      { token, envelope: await encryptValue(ticket, 'submitted value') },
+      { 'client-ip': '192.0.2.2' },
+    );
+    assert.equal(limited.status, 429);
+    assert.deepEqual(await limited.json(), { error: 'rate_limited' });
+    assert.equal(f.store.getState(ticket.id).status, 'active');
+    assert.equal(f.store.getState(ticket.id).usedAt, null);
   });
 }
 
-for (const state of ['unknown', 'expired', 'revoked', 'done']) {
+for (const state of [
+  'unknown',
+  'expired',
+  'revoked',
+  'pending',
+  'processing',
+  'done',
+  'failed',
+]) {
   test(`${state} tickets consume the ticket failure allowance`, async (t) => {
     const f = await webFixture(t, { ticketLimit: 2 });
     const { ticket, token } = f.create();
@@ -75,6 +169,7 @@ for (const state of ['unknown', 'expired', 'revoked', 'done']) {
       ['/api/open', 400],
       ['/api/submit', 400],
       ['/api/open', 429],
+      ['/api/submit', 429],
     ]) {
       const response = await post(
         f.base,
@@ -90,42 +185,44 @@ for (const state of ['unknown', 'expired', 'revoked', 'done']) {
   });
 }
 
-test('valid token envelope errors and internal failures do not consume ticket allowances', async (t) => {
-  const f = await webFixture(t, { ticketLimit: 1 });
-  const { token } = f.create();
-  for (let i = 0; i < 3; i++) {
-    const response = await post(
-      f.base,
-      '/api/submit',
-      { token, envelope: {} },
-      { 'client-ip': '192.0.2.1' },
-    );
-    assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), { error: 'invalid_envelope' });
-  }
-  const open = t.mock.method(f.store, 'open', () => {
-    throw new Error('private failure');
-  });
-  for (let i = 0; i < 3; i++) {
+for (const [failure, path, status, error] of [
+  ['envelope errors', '/api/submit', 400, 'invalid_envelope'],
+  ['internal failures', '/api/open', 500, 'internal_error'],
+]) {
+  test(`valid token ${failure} do not consume ticket allowances`, async (t) => {
+    const f = await webFixture(t, { ticketLimit: 1 });
+    const { ticket, token } = f.create();
+    const open =
+      error === 'internal_error'
+        ? t.mock.method(f.store, 'open', () => {
+            throw new Error('private failure');
+          })
+        : null;
+    try {
+      for (let i = 0; i < 3; i++) {
+        const response = await post(
+          f.base,
+          path,
+          { token, envelope: {} },
+          { 'client-ip': '192.0.2.1' },
+        );
+        assert.equal(response.status, status);
+        assert.deepEqual(await response.json(), { error });
+      }
+    } finally {
+      open?.mock.restore();
+    }
+    const wrongToken = `${ticket.id}.${createToken(f.config.hmacKey).token.split('.')[1]}`;
     const response = await post(
       f.base,
       '/api/open',
-      { token },
+      { token: wrongToken },
       { 'client-ip': '192.0.2.1' },
     );
-    assert.equal(response.status, 500);
-    assert.deepEqual(await response.json(), { error: 'internal_error' });
-  }
-  open.mock.restore();
-  const response = await post(
-    f.base,
-    '/api/open',
-    { token },
-    { 'client-ip': '192.0.2.1' },
-  );
-  assert.equal(response.status, 200);
-  await response.text();
-});
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: 'ticket_unavailable' });
+  });
+}
 
 for (const [body, status] of [
   ['{bad', 400],

@@ -99,7 +99,7 @@ function clientFixture({
   openedTicket = ticket,
   openResponse,
   submitResponse,
-  network = false,
+  encryptResponse,
   linkToken = token,
 } = {}) {
   const document = documentFixture();
@@ -112,12 +112,13 @@ function clientFixture({
       calls.push({ path, ...options, body: JSON.parse(options.body) });
       if (path === '/api/open')
         return openResponse ?? response(200, openedTicket);
-      if (network) throw new TypeError('network error');
-      return submitResponse ?? response(202, { status: 'pending' });
+      return typeof submitResponse === 'function'
+        ? submitResponse()
+        : (submitResponse ?? response(202, { status: 'pending' }));
     },
     encrypt: async (metadata, value) => {
       encrypted.push({ metadata, value });
-      return { encrypted: true };
+      return encryptResponse ?? { encrypted: true };
     },
   });
   return {
@@ -328,17 +329,31 @@ test('successful real submit clears and removes form, shows queued confirmation 
 test('final API errors remove the form and every retry control even on a concurrent submit failure', async () => {
   for (const phase of ['open', 'submit']) {
     const unavailable = response(400, { error: 'ticket_unavailable' });
-    const f = clientFixture(
-      phase === 'open'
+    const encryption = Promise.withResolvers();
+    const f = clientFixture({
+      encryptResponse: encryption.promise,
+      ...(phase === 'open'
         ? { openResponse: unavailable }
-        : { submitResponse: unavailable },
-    );
+        : { submitResponse: unavailable }),
+    });
     const input = f.el('secret');
     await f.el('open-form').emit('click');
     if (phase === 'submit') {
       input.value = 'not stored';
-      await f.el('secret-form').emit('submit');
+      const form = f.el('secret-form');
+      const firstSubmit = form.emit('submit');
+      const secondSubmit = form.emit('submit');
+      assert.equal(f.calls.length, 1);
+      assert.equal(f.el('submit').disabled, true);
+      encryption.resolve({ encrypted: true });
+      await Promise.all([firstSubmit, secondSubmit]);
+      assert.equal(f.calls.length, 2);
+      assert.equal(f.encrypted.length, 1);
     }
+    assert.equal(
+      f.calls.filter((call) => call.path === '/api/submit').length,
+      phase === 'submit' ? 1 : 0,
+    );
     assert.equal(f.el('state-expired').hidden, false);
     assert.equal(f.el('secret'), null);
     assert.equal(f.el('secret-form'), null);
@@ -349,22 +364,78 @@ test('final API errors remove the form and every retry control even on a concurr
   }
 });
 
-test('transient submit errors keep the form for deliberate retry without automatically resubmitting', async () => {
-  for (const options of [
-    { network: true },
-    { submitResponse: response(429, { error: 'rate_limited' }) },
-    { submitResponse: response(503, { error: 'internal_error' }) },
+test('pending submit requests ignore concurrent submits after the value is re-entered', async () => {
+  const started = Promise.withResolvers();
+  const submission = Promise.withResolvers();
+  const f = clientFixture({
+    submitResponse: () => {
+      started.resolve();
+      return submission.promise;
+    },
+  });
+  await f.el('open-form').emit('click');
+  const input = f.el('secret');
+  const form = f.el('secret-form');
+  input.value = 'not stored';
+  const firstSubmit = form.emit('submit');
+  await started.promise;
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.el('submit').disabled, true);
+  assert.equal(input.value, '');
+
+  input.value = 'not stored';
+  const secondSubmit = form.emit('submit');
+  submission.resolve(response(400, { error: 'ticket_unavailable' }));
+  await Promise.all([firstSubmit, secondSubmit]);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls.filter((call) => call.path === '/api/submit').length, 1);
+  assert.equal(f.encrypted.length, 1);
+  assert.equal(f.el('state-expired').hidden, false);
+  assert.equal(f.el('secret-form'), null);
+  assert.equal(input.value, '');
+});
+
+test('transient submit errors allow a successful explicit retry without automatically resubmitting', async () => {
+  for (const failure of [
+    new TypeError('network error'),
+    response(429, { error: 'rate_limited' }),
+    response(503, { error: 'internal_error' }),
   ]) {
-    const f = clientFixture(options);
+    const firstAttempt = Promise.withResolvers();
+    const retry = Promise.withResolvers();
+    const attempts = [firstAttempt.promise, retry.promise];
+    const f = clientFixture({ submitResponse: () => attempts.shift() });
     await f.el('open-form').emit('click');
-    f.el('secret').value = 'retry deliberately';
-    await f.el('secret-form').emit('submit');
+    const input = f.el('secret');
+    input.value = 'retry deliberately';
+    const firstSubmit = f.el('secret-form').emit('submit');
+    if (failure instanceof Error) firstAttempt.reject(failure);
+    else firstAttempt.resolve(failure);
+    await firstSubmit;
     assert.equal(f.calls.length, 2);
+    assert.equal(
+      f.calls.filter((call) => call.path === '/api/submit').length,
+      1,
+    );
     assert.equal(f.el('state-form').hidden, false);
     assert.equal(f.el('state-expired').hidden, true);
-    assert.equal(f.el('secret').value, '');
+    assert.equal(input.value, '');
     assert.equal(f.el('submit').disabled, false);
     assert(f.el('status').textContent);
+
+    input.value = 'retry deliberately';
+    const retrySubmit = f.el('secret-form').emit('submit');
+    retry.resolve(response(202, { status: 'pending' }));
+    await retrySubmit;
+    assert.equal(f.calls.length, 3);
+    assert.equal(
+      f.calls.filter((call) => call.path === '/api/submit').length,
+      2,
+    );
+    assert.equal(f.encrypted.length, 2);
+    assert.equal(input.value, '');
+    assert.equal(f.el('secret-form'), null);
+    assert.equal(f.el('state-success').hidden, false);
   }
 });
 

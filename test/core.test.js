@@ -640,6 +640,19 @@ test('structured logs redact sensitive fields and untrusted error messages', () 
   assert.equal(record.attempts, 1);
 });
 
+test('structured logs allow safe integer shutdown waits but redact other values', () => {
+  const logs = [];
+  const logger = createLogger({ write: (line) => logs.push(line) });
+  for (const waitedMs of [0, 100, 5000]) {
+    logger.info('shutdown_notification_pending', { waitedMs });
+    assert.equal(JSON.parse(logs.at(-1)).waitedMs, waitedMs);
+  }
+  for (const waitedMs of ['private-wait-value', 1.5, NaN, Infinity, {}]) {
+    logger.info('shutdown_notification_pending', { waitedMs });
+    assert.equal(JSON.parse(logs.at(-1)).waitedMs, '[REDACTED]');
+  }
+});
+
 test('fixed-window limits enforce IP, ticket and bounded memory independently', () => {
   const limiter = new RateLimiter({
     ipLimit: 2,

@@ -64,6 +64,36 @@ test('writer retry configuration rejects invalid timers and inverted bounds', as
   );
 });
 
+test('shutdown wait configuration is writer-only and defaults to 5000 with bounded overrides including zero', async (t) => {
+  const env = await writerEnv(t);
+  assert.equal(loadConfig(env, 'writer').shutdownWaitMs, 5000);
+  for (const value of ['0', '100', '2147483647'])
+    assert.equal(
+      loadConfig({ ...env, INTAKE_SHUTDOWN_WAIT_MS: value }, 'writer')
+        .shutdownWaitMs,
+      Number(value),
+    );
+  for (const value of [
+    '-1',
+    '1.5',
+    'invalid',
+    'NaN',
+    'Infinity',
+    '2147483648',
+    '9007199254740992',
+  ])
+    assert.throws(
+      () => loadConfig({ ...env, INTAKE_SHUTDOWN_WAIT_MS: value }, 'writer'),
+      { code: 'invalid_intake_shutdown_wait_ms' },
+    );
+  for (const role of ['web', 'cli'])
+    assert.equal(
+      loadConfig({ ...env, INTAKE_SHUTDOWN_WAIT_MS: 'invalid' }, role)
+        .shutdownWaitMs,
+      undefined,
+    );
+});
+
 test('stuck-attempt configuration is writer-only and defaults to 10 within 1 through 31', async (t) => {
   const env = await writerEnv(t);
   assert.equal(loadConfig(env, 'writer').stuckAttempts, 10);

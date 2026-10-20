@@ -6,12 +6,15 @@ import { createServer } from 'node:http';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import Database from 'better-sqlite3';
 import { TicketStore } from '../src/db.js';
+import { IntakeError } from '../src/errors.js';
 import { listen, closeServer } from '../src/http.js';
-import { BwServeAdapter, VaultError } from '../src/vault.js';
+import { BwServeAdapter, MockVaultAdapter, VaultError } from '../src/vault.js';
 import { startWriter } from '../src/writer.js';
 import { encryptValue } from '../public/crypto.js';
-import { fixture } from '../support/fixtures.js';
+import { fixture, waitFor } from '../support/fixtures.js';
+import { encryptRawValue } from '../support/raw-envelope.js';
 
 const execute = promisify(execFile);
 const privateValue = 'retry-private-value-7bdf293a';
@@ -88,6 +91,10 @@ function adapter(server, options = {}) {
   });
 }
 
+function ambiguousWrite() {
+  throw Object.assign(new VaultError('vault_network'), { ambiguous: true });
+}
+
 async function queue(f) {
   const { ticket, token } = f.create();
   const envelope = await encryptValue(f.store.open(token), privateValue);
@@ -121,6 +128,1066 @@ async function writer(f, vault, options = {}) {
   await instance.drain();
   return instance;
 }
+
+test('private database write contention retries markSeen without losing the key', async (t) => {
+  const f = await retryFixture(t);
+  let now = Date.now();
+  const vault = new MockVaultAdapter();
+  const write = t.mock.method(vault, 'write');
+  const instance = await writer(f, vault, { now: () => now });
+  const queued = await queue(f);
+  assert.equal(f.store.db.pragma('busy_timeout', { simple: true }), 5000);
+  assert.equal(f.keys.db.pragma('busy_timeout', { simple: true }), 5000);
+  f.keys.db.pragma('busy_timeout = 5');
+  const blocker = new Database(f.config.privateDbPath);
+  f.cleanup(() => blocker.close());
+  const fail = t.mock.method(f.store, 'fail');
+  const removeKey = t.mock.method(f.keys, 'delete');
+  blocker.exec('BEGIN IMMEDIATE');
+
+  await instance.drain();
+  assertPending(f, queued, 1, now + 5000);
+  const pending = f.store.getState(queued.ticket.id);
+  assert.equal(pending.failureCode, 'database_busy');
+  assert.equal(pending.notifyStatus, null);
+  assert.equal(f.keys.getMetadata(queued.ticket.id).firstSeenAt, null);
+  assert.equal(fail.mock.callCount(), 0);
+  assert.equal(removeKey.mock.callCount(), 0);
+  assert.equal(write.mock.callCount(), 0);
+  assert.equal(vault.entries.length, 0);
+
+  blocker.exec('ROLLBACK');
+  now += 4999;
+  await instance.drain();
+  assertPending(f, queued, 1, now + 1);
+  assert.equal(vault.entries.length, 0);
+  now += 2;
+  await instance.drain();
+  assert.equal(f.store.getState(queued.ticket.id).status, 'done');
+  assert.equal(f.keys.get(queued.ticket.id), undefined);
+  assert.deepEqual(
+    vault.entries.map(({ value }) => value),
+    [privateValue],
+  );
+  await instance.drain();
+  assert.equal(write.mock.callCount(), 1);
+  assert.equal(vault.entries.length, 1);
+});
+
+test('private database contention stops each drain after one markSeen attempt', async (t) => {
+  const f = await retryFixture(t);
+  let now = Date.now();
+  const vault = new MockVaultAdapter();
+  const write = t.mock.method(vault, 'write');
+  const instance = await writer(f, vault, { now: () => now });
+  const queued = [await queue(f), await queue(f), await queue(f)];
+  f.keys.db.pragma('busy_timeout = 5');
+  const blocker = new Database(f.config.privateDbPath);
+  f.cleanup(() => blocker.close());
+  const markSeen = t.mock.method(f.keys, 'markSeen');
+  const fail = t.mock.method(f.store, 'fail');
+  const removeKey = t.mock.method(f.keys, 'delete');
+  blocker.exec('BEGIN IMMEDIATE');
+
+  for (let drain = 1; drain <= 2; drain += 1) {
+    await instance.drain();
+    assert.equal(markSeen.mock.callCount(), drain);
+    for (const entry of queued) {
+      const attempted = markSeen.mock.calls.some(
+        ({ arguments: [id] }) => id === entry.ticket.id,
+      );
+      assertPending(f, entry, attempted ? 1 : 0, attempted ? now + 5000 : 0);
+      const state = f.store.getState(entry.ticket.id);
+      assert.equal(state.failureCode, attempted ? 'database_busy' : null);
+      assert.equal(state.notifyStatus, null);
+      assert.equal(f.keys.getMetadata(entry.ticket.id).firstSeenAt, null);
+    }
+    assert.equal(fail.mock.callCount(), 0);
+    assert.equal(removeKey.mock.callCount(), 0);
+    assert.equal(write.mock.callCount(), 0);
+    assert.equal(vault.entries.length, 0);
+  }
+
+  blocker.exec('ROLLBACK');
+  now += 5000;
+  await instance.drain();
+  for (const entry of queued) {
+    assert.equal(f.store.getState(entry.ticket.id).status, 'done');
+    assert.equal(f.keys.get(entry.ticket.id), undefined);
+    assert.equal(
+      write.mock.calls.filter(
+        ({ arguments: [input] }) => input.ticketId === entry.ticket.id,
+      ).length,
+      1,
+    );
+  }
+  assert.deepEqual(
+    vault.entries.map(({ value }) => value),
+    queued.map(() => privateValue),
+  );
+  await instance.drain();
+  assert.equal(write.mock.callCount(), queued.length);
+  assert.equal(vault.entries.length, queued.length);
+});
+
+for (const resolving of [false, true]) {
+  for (const [database, method, code] of [
+    ['keys', 'getMetadata', 'SQLITE_BUSY'],
+    ['keys', 'markSeen', 'SQLITE_LOCKED'],
+    ['keys', 'get', 'SQLITE_BUSY_SNAPSHOT'],
+    ['store', 'get', 'SQLITE_LOCKED_SHAREDCACHE'],
+  ]) {
+    test(`${resolving ? 'unknown' : 'pending'} ticket preserves material after ${database}.${method} throws ${code}`, async (t) => {
+      const f = await retryFixture(t);
+      let now = Date.now();
+      const vault = new MockVaultAdapter();
+      const lookup = t.mock.method(vault, 'lookup');
+      const instance = await writer(f, vault, { now: () => now });
+      const queued = await queue(f);
+      if (resolving)
+        f.store.retry(queued.ticket.id, 'vault_network', {
+          now: now - 5000,
+          unknown: true,
+        });
+      const fail = t.mock.method(f.store, 'fail');
+      const removeKey = t.mock.method(f.keys, 'delete');
+      t.mock.method(
+        f[database],
+        method,
+        () => {
+          throw new Database.SqliteError('simulated_lock', code);
+        },
+        { times: 1 },
+      );
+
+      await instance.drain();
+      const state = f.store.getState(queued.ticket.id);
+      assert.equal(state.status, resolving ? 'unknown' : 'pending');
+      assert.equal(state.attempts, resolving ? 2 : 1);
+      assert.equal(state.nextAttemptAt, now + (resolving ? 10000 : 5000));
+      assert.equal(state.failureCode, 'database_busy');
+      assert.equal(state.notifyStatus, null);
+      assert.deepEqual(state.envelope, queued.envelope);
+      assert.equal(f.keys.get(queued.ticket.id), queued.key);
+      assert.equal(fail.mock.callCount(), 0);
+      assert.equal(removeKey.mock.callCount(), 0);
+      assert.equal(lookup.mock.callCount(), 0);
+      assert.equal(vault.entries.length, 0);
+      assert(
+        f.logs.some((line) => {
+          const entry = JSON.parse(line);
+          return (
+            entry.event ===
+              (resolving ? 'ticket_unknown' : 'ticket_requeued') &&
+            entry.code === 'database_busy'
+          );
+        }),
+      );
+
+      now = state.nextAttemptAt + 1;
+      await instance.drain();
+      assert.equal(f.store.getState(queued.ticket.id).status, 'done');
+      assert.equal(f.keys.get(queued.ticket.id), undefined);
+      assert.equal(lookup.mock.callCount(), resolving ? 1 : 0);
+      assert.deepEqual(
+        vault.entries.map(({ value }) => value),
+        [privateValue],
+      );
+    });
+  }
+}
+
+for (const [database, method, code] of [
+  ['keys', 'getMetadata', 'SQLITE_IOERR'],
+  ['keys', 'markSeen', 'SQLITE_IOERR'],
+  ['store', 'get', 'SQLITE_IOERR'],
+  ['keys', 'get', 'SQLITE_IOERR'],
+  ['keys', 'markSeen', null],
+]) {
+  test(`unknown ticket preserves material after ${database}.${method} throws ${code ?? 'Error'}`, async (t) => {
+    const f = await retryFixture(t);
+    let now = Date.now();
+    const vault = new MockVaultAdapter();
+    const lookup = t.mock.method(vault, 'lookup');
+    const write = t.mock.method(vault, 'write');
+    write.mock.mockImplementationOnce(ambiguousWrite);
+    const instance = await writer(f, vault, {
+      now: () => now,
+      // Inject into processTicket rather than periodic metadata pruning.
+      pruneIntervalMs: 600000,
+    });
+    const queued = await queue(f);
+    await instance.drain();
+    const ambiguous = f.store.getState(queued.ticket.id);
+    assert.equal(ambiguous.status, 'unknown');
+    assert.equal(ambiguous.failureCode, 'vault_network');
+    assert.equal(write.mock.callCount(), 1);
+    assert.equal(vault.entries.length, 0);
+    now = ambiguous.nextAttemptAt;
+    const fail = t.mock.method(f.store, 'fail');
+    const removeKey = t.mock.method(f.keys, 'delete');
+    t.mock.method(
+      f[database],
+      method,
+      () => {
+        throw code
+          ? new Database.SqliteError('simulated_io_failure', code)
+          : new Error('simulated_local_failure');
+      },
+      { times: 1 },
+    );
+
+    await instance.drain();
+    const state = f.store.getState(queued.ticket.id);
+    assert.equal(state.status, 'unknown');
+    assert.equal(state.attempts, 2);
+    assert.equal(state.nextAttemptAt, now + 10000);
+    assert.equal(state.failureCode, 'writer_state_failed');
+    assert.equal(state.notifyStatus, null);
+    assert.deepEqual(state.envelope, queued.envelope);
+    assert.equal(f.keys.get(queued.ticket.id), queued.key);
+    assert.equal(fail.mock.callCount(), 0);
+    assert.equal(removeKey.mock.callCount(), 0);
+    assert.equal(lookup.mock.callCount(), 0);
+    assert.equal(write.mock.callCount(), 1);
+    assert.equal(vault.entries.length, 0);
+
+    now = state.nextAttemptAt - 1;
+    await instance.drain();
+    assert.equal(lookup.mock.callCount(), 0);
+    assert.equal(write.mock.callCount(), 1);
+    now += 1;
+    await instance.drain();
+    assert.equal(f.store.getState(queued.ticket.id).status, 'done');
+    assert.equal(f.keys.get(queued.ticket.id), undefined);
+    assert.equal(lookup.mock.callCount(), 1);
+    assert.equal(await lookup.mock.calls[0].result, null);
+    assert.equal(write.mock.callCount(), 2);
+    assert.deepEqual(
+      vault.entries.map(({ value }) => value),
+      [privateValue],
+    );
+    await instance.drain();
+    assert.equal(lookup.mock.callCount(), 1);
+    assert.equal(write.mock.callCount(), 2);
+  });
+}
+
+test('unknown SQLite I/O failures stop each drain after one local attempt', async (t) => {
+  const f = await retryFixture(t);
+  let now = Date.now();
+  const vault = new MockVaultAdapter();
+  const lookup = t.mock.method(vault, 'lookup');
+  const queued = [await queue(f), await queue(f), await queue(f)];
+  const write = t.mock.method(vault, 'write');
+  for (let attempt = 0; attempt < queued.length; attempt += 1)
+    write.mock.mockImplementationOnce(ambiguousWrite, attempt);
+  const instance = await writer(f, vault, { now: () => now });
+  for (const entry of queued)
+    assert.equal(f.store.getState(entry.ticket.id).status, 'unknown');
+  now = Math.max(
+    ...queued.map((entry) => f.store.getState(entry.ticket.id).nextAttemptAt),
+  );
+  const fail = t.mock.method(f.store, 'fail');
+  const removeKey = t.mock.method(f.keys, 'delete');
+  const markSeen = t.mock.method(f.keys, 'markSeen', () => {
+    throw new Database.SqliteError('simulated_io_failure', 'SQLITE_IOERR');
+  });
+
+  for (let drain = 1; drain <= 2; drain += 1) {
+    await instance.drain();
+    assert.equal(markSeen.mock.callCount(), drain);
+    for (const entry of queued) {
+      const attempted = markSeen.mock.calls.some(
+        ({ arguments: [id] }) => id === entry.ticket.id,
+      );
+      const state = f.store.getState(entry.ticket.id);
+      assert.equal(state.status, 'unknown');
+      assert.equal(state.attempts, attempted ? 2 : 1);
+      assert.equal(state.nextAttemptAt, attempted ? now + 10000 : now);
+      assert.equal(
+        state.failureCode,
+        attempted ? 'writer_state_failed' : 'vault_network',
+      );
+      assert.equal(state.notifyStatus, null);
+      assert.deepEqual(state.envelope, entry.envelope);
+      assert.equal(f.keys.get(entry.ticket.id), entry.key);
+    }
+    assert.equal(fail.mock.callCount(), 0);
+    assert.equal(removeKey.mock.callCount(), 0);
+    assert.equal(lookup.mock.callCount(), 0);
+    assert.equal(write.mock.callCount(), queued.length);
+    assert.equal(vault.entries.length, 0);
+  }
+
+  markSeen.mock.restore();
+  now += 10000;
+  await instance.drain();
+  for (const entry of queued) {
+    assert.equal(f.store.getState(entry.ticket.id).status, 'done');
+    assert.equal(f.keys.get(entry.ticket.id), undefined);
+    assert.equal(
+      vault.entries.filter(({ ticketId }) => ticketId === entry.ticket.id)
+        .length,
+      1,
+    );
+  }
+  assert.equal(lookup.mock.callCount(), queued.length);
+  assert.equal(write.mock.callCount(), queued.length * 2);
+});
+
+test('locked retry commit escapes to recovery without failing or deleting the key', async (t) => {
+  const f = await retryFixture(t);
+  let now = Date.now();
+  const vault = new MockVaultAdapter();
+  const instance = await writer(f, vault, { now: () => now });
+  const queued = await queue(f);
+  f.store.db.pragma('busy_timeout = 5');
+  const blocker = new Database(f.config.dbPath);
+  f.cleanup(() => blocker.close());
+  const fail = t.mock.method(f.store, 'fail');
+  const removeKey = t.mock.method(f.keys, 'delete');
+  const retry = t.mock.method(f.store, 'retry');
+  t.mock.method(
+    f.keys,
+    'markSeen',
+    () => {
+      // begin() has committed processing before the tickets database becomes locked.
+      blocker.exec('BEGIN IMMEDIATE');
+      throw new Database.SqliteError('simulated_lock', 'SQLITE_BUSY');
+    },
+    { times: 1 },
+  );
+
+  await instance.drain();
+  assert.equal(retry.mock.callCount(), 1);
+  assert.equal(retry.mock.calls[0].arguments[1], 'database_busy');
+  assert.equal(retry.mock.calls[0].error.code, 'SQLITE_BUSY');
+  const processing = f.store.getState(queued.ticket.id);
+  assert.equal(processing.status, 'processing');
+  assert.equal(processing.attempts, 0);
+  assert.equal(processing.failureCode, null);
+  assert.equal(processing.notifyStatus, null);
+  assert.deepEqual(processing.envelope, queued.envelope);
+  assert.equal(f.keys.get(queued.ticket.id), queued.key);
+  await instance.drain();
+  assert.equal(f.store.getState(queued.ticket.id).status, 'processing');
+  assert.equal(fail.mock.callCount(), 0);
+  assert.equal(removeKey.mock.callCount(), 0);
+  assert.equal(vault.entries.length, 0);
+
+  blocker.exec('ROLLBACK');
+  await instance.drain();
+  const recovered = f.store.getState(queued.ticket.id);
+  assert.equal(recovered.status, 'unknown');
+  assert.equal(recovered.attempts, 1);
+  assert.equal(recovered.failureCode, 'writer_state_failed');
+  assert.equal(recovered.nextAttemptAt, now + 120000);
+  assert.deepEqual(recovered.envelope, queued.envelope);
+  assert.equal(f.keys.get(queued.ticket.id), queued.key);
+  assert.equal(vault.entries.length, 0);
+  now = recovered.nextAttemptAt + 1;
+  await instance.drain();
+  assert.equal(f.store.getState(queued.ticket.id).status, 'done');
+  assert.deepEqual(
+    vault.entries.map(({ value }) => value),
+    [privateValue],
+  );
+});
+
+for (const phase of ['finish', 'lookup']) {
+  test(`database lock during ${phase} keeps the existing unknown path`, async (t) => {
+    const f = await retryFixture(t);
+    let now = Date.now();
+    const vault = new MockVaultAdapter();
+    const instance = await writer(f, vault, { now: () => now });
+    const queued = await queue(f);
+    if (phase === 'lookup')
+      f.store.retry(queued.ticket.id, 'vault_network', {
+        now: now - 5000,
+        unknown: true,
+      });
+    t.mock.method(
+      phase === 'finish' ? f.store : vault,
+      phase,
+      () => {
+        throw new Database.SqliteError('simulated_lock', 'SQLITE_BUSY');
+      },
+      { times: 1 },
+    );
+
+    await instance.drain();
+    const state = f.store.getState(queued.ticket.id);
+    assert.equal(state.status, 'unknown');
+    assert.equal(state.failureCode, 'writer_state_failed');
+    assert.equal(
+      state.nextAttemptAt,
+      now + (phase === 'finish' ? 120000 : 10000),
+    );
+    assert.deepEqual(state.envelope, queued.envelope);
+    assert.equal(f.keys.get(queued.ticket.id), queued.key);
+    assert.equal(vault.entries.length, phase === 'finish' ? 1 : 0);
+    now = state.nextAttemptAt + 1;
+    await instance.drain();
+    assert.equal(f.store.getState(queued.ticket.id).status, 'done');
+    assert.deepEqual(
+      vault.entries.map(({ value }) => value),
+      [privateValue],
+    );
+  });
+}
+
+test('unknown retry commit I/O failure escapes to recovery without losing material', async (t) => {
+  const f = await retryFixture(t);
+  let now = Date.now();
+  const vault = new MockVaultAdapter();
+  const lookup = t.mock.method(vault, 'lookup');
+  const write = t.mock.method(vault, 'write');
+  write.mock.mockImplementationOnce(ambiguousWrite);
+  const instance = await writer(f, vault, { now: () => now });
+  const queued = await queue(f);
+  await instance.drain();
+  now = f.store.getState(queued.ticket.id).nextAttemptAt;
+  const fail = t.mock.method(f.store, 'fail');
+  const removeKey = t.mock.method(f.keys, 'delete');
+  t.mock.method(
+    f.keys,
+    'markSeen',
+    () => {
+      throw new Database.SqliteError('simulated_io_failure', 'SQLITE_IOERR');
+    },
+    { times: 1 },
+  );
+  const retry = t.mock.method(
+    f.store,
+    'retry',
+    () => {
+      throw new Database.SqliteError('simulated_io_failure', 'SQLITE_IOERR');
+    },
+    { times: 1 },
+  );
+
+  await instance.drain();
+  assert.equal(retry.mock.callCount(), 1);
+  assert.equal(retry.mock.calls[0].arguments[1], 'writer_state_failed');
+  const processing = f.store.getState(queued.ticket.id);
+  assert.equal(processing.status, 'processing');
+  assert.equal(processing.notifyStatus, null);
+  assert.deepEqual(processing.envelope, queued.envelope);
+  assert.equal(f.keys.get(queued.ticket.id), queued.key);
+  assert.equal(fail.mock.callCount(), 0);
+  assert.equal(removeKey.mock.callCount(), 0);
+  assert.equal(lookup.mock.callCount(), 0);
+  assert.equal(write.mock.callCount(), 1);
+
+  await instance.drain();
+  const recovered = f.store.getState(queued.ticket.id);
+  assert.equal(recovered.status, 'unknown');
+  assert.equal(recovered.attempts, 2);
+  assert.equal(recovered.failureCode, 'writer_state_failed');
+  assert.equal(recovered.nextAttemptAt, now + 120000);
+  assert.equal(recovered.notifyStatus, null);
+  assert.deepEqual(recovered.envelope, queued.envelope);
+  assert.equal(f.keys.get(queued.ticket.id), queued.key);
+  assert.equal(fail.mock.callCount(), 0);
+  assert.equal(removeKey.mock.callCount(), 0);
+  assert.equal(lookup.mock.callCount(), 0);
+  assert.equal(write.mock.callCount(), 1);
+  now = recovered.nextAttemptAt;
+  await instance.drain();
+  assert.equal(f.store.getState(queued.ticket.id).status, 'done');
+  assert.equal(f.keys.get(queued.ticket.id), undefined);
+  assert.equal(lookup.mock.callCount(), 1);
+  assert.equal(write.mock.callCount(), 2);
+  assert.deepEqual(
+    vault.entries.map(({ value }) => value),
+    [privateValue],
+  );
+});
+
+for (const [database, method] of [
+  ['keys', 'getMetadata'],
+  ['keys', 'markSeen'],
+  ['store', 'get'],
+  ['keys', 'get'],
+]) {
+  test(`pending ticket preserves material after ${database}.${method} throws SQLITE_IOERR`, async (t) => {
+    const f = await retryFixture(t);
+    let now = Date.now();
+    const vault = new MockVaultAdapter();
+    const write = t.mock.method(vault, 'write');
+    const instance = await writer(f, vault, {
+      now: () => now,
+      // Inject into processTicket rather than periodic metadata pruning.
+      pruneIntervalMs: 600000,
+    });
+    const queued = await queue(f);
+    const fail = t.mock.method(f.store, 'fail');
+    const removeKey = t.mock.method(f.keys, 'delete');
+    t.mock.method(
+      f[database],
+      method,
+      () => {
+        throw new Database.SqliteError('simulated_io_failure', 'SQLITE_IOERR');
+      },
+      { times: 1 },
+    );
+
+    await instance.drain();
+    const state = f.store.getState(queued.ticket.id);
+    assert.equal(state.status, 'pending');
+    assert.equal(state.attempts, 1);
+    assert.equal(state.nextAttemptAt, now + 5000);
+    assert.equal(state.failureCode, 'writer_state_failed');
+    assert.equal(state.notifyStatus, null);
+    assert.deepEqual(state.envelope, queued.envelope);
+    assert.equal(f.keys.get(queued.ticket.id), queued.key);
+    assert.equal(fail.mock.callCount(), 0);
+    assert.equal(removeKey.mock.callCount(), 0);
+    assert.equal(write.mock.callCount(), 0);
+    assert.equal(vault.entries.length, 0);
+    assert(
+      f.logs.some((line) => {
+        const entry = JSON.parse(line);
+        return (
+          entry.event === 'ticket_requeued' &&
+          entry.code === 'writer_state_failed'
+        );
+      }),
+    );
+
+    now = state.nextAttemptAt - 1;
+    await instance.drain();
+    assert.equal(write.mock.callCount(), 0);
+    assert.equal(f.store.getState(queued.ticket.id).status, 'pending');
+    now += 1;
+    await instance.drain();
+    assert.equal(f.store.getState(queued.ticket.id).status, 'done');
+    assert.equal(f.keys.get(queued.ticket.id), undefined);
+    assert.equal(write.mock.callCount(), 1);
+    assert.deepEqual(
+      vault.entries.map(({ value }) => value),
+      [privateValue],
+    );
+    await instance.drain();
+    assert.equal(write.mock.callCount(), 1);
+    assert.equal(vault.entries.length, 1);
+  });
+}
+
+test('pending non-SQLite local errors retry without stopping the drain', async (t) => {
+  const f = await retryFixture(t);
+  let now = Date.now();
+  const vault = new MockVaultAdapter();
+  const write = t.mock.method(vault, 'write');
+  const instance = await writer(f, vault, {
+    now: () => now,
+    pruneIntervalMs: 600000,
+  });
+  const queued = [await queue(f), await queue(f)];
+  const get = t.mock.method(
+    f.store,
+    'get',
+    () => {
+      throw new Error('boom');
+    },
+    { times: 1 },
+  );
+
+  await instance.drain();
+  assert.equal(get.mock.callCount(), 1);
+  const retried = queued.find(
+    (entry) => entry.ticket.id === get.mock.calls[0].arguments[0],
+  );
+  const continued = queued.find((entry) => entry !== retried);
+  const state = f.store.getState(retried.ticket.id);
+  assert.equal(state.status, 'pending');
+  assert.equal(state.attempts, 1);
+  assert.equal(state.nextAttemptAt, now + 5000);
+  assert.equal(state.failureCode, 'writer_state_failed');
+  assert.equal(state.notifyStatus, null);
+  assert.deepEqual(state.envelope, retried.envelope);
+  assert.equal(f.keys.get(retried.ticket.id), retried.key);
+  assert.equal(f.store.getState(continued.ticket.id).status, 'done');
+  assert.equal(f.keys.get(continued.ticket.id), undefined);
+  assert.equal(write.mock.callCount(), 1);
+  assert.equal(write.mock.calls[0].arguments[0].ticketId, continued.ticket.id);
+  assert.equal(vault.entries.length, 1);
+
+  now = state.nextAttemptAt;
+  await instance.drain();
+  assert.equal(f.store.getState(retried.ticket.id).status, 'done');
+  assert.equal(f.keys.get(retried.ticket.id), undefined);
+  assert.equal(write.mock.callCount(), 2);
+  assert.equal(
+    write.mock.calls.filter(
+      ({ arguments: [input] }) => input.ticketId === retried.ticket.id,
+    ).length,
+    1,
+  );
+});
+
+test('pending SQLite I/O failures stop the drain before later tickets', async (t) => {
+  const f = await retryFixture(t);
+  let now = Date.now();
+  const vault = new MockVaultAdapter();
+  const write = t.mock.method(vault, 'write');
+  const instance = await writer(f, vault, {
+    now: () => now,
+    pruneIntervalMs: 600000,
+  });
+  const queued = [await queue(f), await queue(f)];
+  const markSeen = t.mock.method(
+    f.keys,
+    'markSeen',
+    () => {
+      throw new Database.SqliteError('simulated_io_failure', 'SQLITE_IOERR');
+    },
+    { times: 1 },
+  );
+
+  await instance.drain();
+  assert.equal(markSeen.mock.callCount(), 1);
+  const attempted = queued.find(
+    (entry) => entry.ticket.id === markSeen.mock.calls[0].arguments[0],
+  );
+  const untouched = queued.find((entry) => entry !== attempted);
+  const attemptedState = f.store.getState(attempted.ticket.id);
+  assert.equal(attemptedState.status, 'pending');
+  assert.equal(attemptedState.attempts, 1);
+  assert.equal(attemptedState.nextAttemptAt, now + 5000);
+  assert.equal(attemptedState.failureCode, 'writer_state_failed');
+  assert.equal(attemptedState.notifyStatus, null);
+  assert.deepEqual(attemptedState.envelope, attempted.envelope);
+  assert.equal(f.keys.get(attempted.ticket.id), attempted.key);
+  assertPending(f, untouched, 0, 0);
+  assert.equal(f.store.getState(untouched.ticket.id).failureCode, null);
+  assert.equal(f.store.getState(untouched.ticket.id).notifyStatus, null);
+  assert.equal(write.mock.callCount(), 0);
+  assert.equal(vault.entries.length, 0);
+
+  await instance.drain();
+  assert.equal(f.store.getState(untouched.ticket.id).status, 'done');
+  assert.equal(f.keys.get(untouched.ticket.id), undefined);
+  assert.equal(f.store.getState(attempted.ticket.id).status, 'pending');
+  assert.equal(f.store.getState(attempted.ticket.id).attempts, 1);
+  assert.equal(write.mock.callCount(), 1);
+  assert.equal(write.mock.calls[0].arguments[0].ticketId, untouched.ticket.id);
+
+  now = attemptedState.nextAttemptAt;
+  await instance.drain();
+  assert.equal(f.store.getState(attempted.ticket.id).status, 'done');
+  assert.equal(f.keys.get(attempted.ticket.id), undefined);
+  assert.equal(write.mock.callCount(), 2);
+  assert.equal(
+    write.mock.calls.filter(
+      ({ arguments: [input] }) => input.ticketId === attempted.ticket.id,
+    ).length,
+    1,
+  );
+});
+
+test('pending retry commit I/O failure escapes to recovery without losing material', async (t) => {
+  const f = await retryFixture(t);
+  let now = Date.now();
+  const vault = new MockVaultAdapter();
+  const lookup = t.mock.method(vault, 'lookup');
+  const write = t.mock.method(vault, 'write');
+  const instance = await writer(f, vault, {
+    now: () => now,
+    pruneIntervalMs: 600000,
+  });
+  const queued = await queue(f);
+  const fail = t.mock.method(f.store, 'fail');
+  const removeKey = t.mock.method(f.keys, 'delete');
+  t.mock.method(
+    f.keys,
+    'markSeen',
+    () => {
+      throw new Database.SqliteError('simulated_io_failure', 'SQLITE_IOERR');
+    },
+    { times: 1 },
+  );
+  const retry = t.mock.method(
+    f.store,
+    'retry',
+    () => {
+      throw new Database.SqliteError('simulated_io_failure', 'SQLITE_IOERR');
+    },
+    { times: 1 },
+  );
+
+  await instance.drain();
+  assert.equal(retry.mock.callCount(), 1);
+  assert.equal(retry.mock.calls[0].arguments[1], 'writer_state_failed');
+  assert.equal(retry.mock.calls[0].error.code, 'SQLITE_IOERR');
+  const processing = f.store.getState(queued.ticket.id);
+  assert.equal(processing.status, 'processing');
+  assert.equal(processing.attempts, 0);
+  assert.equal(processing.failureCode, null);
+  assert.equal(processing.notifyStatus, null);
+  assert.deepEqual(processing.envelope, queued.envelope);
+  assert.equal(f.keys.get(queued.ticket.id), queued.key);
+  assert.equal(fail.mock.callCount(), 0);
+  assert.equal(removeKey.mock.callCount(), 0);
+  assert.equal(lookup.mock.callCount(), 0);
+  assert.equal(write.mock.callCount(), 0);
+  assert(
+    f.logs.some((line) => {
+      const entry = JSON.parse(line);
+      return (
+        entry.event === 'writer_loop_error' && entry.code === 'internal_error'
+      );
+    }),
+  );
+
+  await instance.drain();
+  const recovered = f.store.getState(queued.ticket.id);
+  // Interrupted processing is ambiguous: recoverInterrupted keeps unknown.
+  assert.equal(recovered.status, 'unknown');
+  assert.equal(recovered.attempts, 1);
+  assert.equal(recovered.failureCode, 'writer_state_failed');
+  assert.equal(recovered.nextAttemptAt, now + 120000);
+  assert.equal(recovered.notifyStatus, null);
+  assert.deepEqual(recovered.envelope, queued.envelope);
+  assert.equal(f.keys.get(queued.ticket.id), queued.key);
+  assert.equal(fail.mock.callCount(), 0);
+  assert.equal(removeKey.mock.callCount(), 0);
+  assert.equal(lookup.mock.callCount(), 0);
+  assert.equal(write.mock.callCount(), 0);
+
+  now = recovered.nextAttemptAt - 1;
+  await instance.drain();
+  assert.equal(lookup.mock.callCount(), 0);
+  assert.equal(write.mock.callCount(), 0);
+  now += 1;
+  await instance.drain();
+  assert.equal(f.store.getState(queued.ticket.id).status, 'done');
+  assert.equal(f.keys.get(queued.ticket.id), undefined);
+  assert.equal(lookup.mock.callCount(), 1);
+  assert.equal(write.mock.callCount(), 1);
+  assert.deepEqual(
+    vault.entries.map(({ value }) => value),
+    [privateValue],
+  );
+  await instance.drain();
+  assert.equal(lookup.mock.callCount(), 1);
+  assert.equal(write.mock.callCount(), 1);
+});
+
+for (const [label, arrange, code] of [
+  [
+    'missing metadata',
+    (f, queued) => {
+      f.keys.db
+        .prepare('DELETE FROM ticket_metadata WHERE id = ?')
+        .run(queued.ticket.id);
+    },
+    'writer_failed',
+  ],
+  [
+    'revoked metadata',
+    (f, queued) => {
+      f.keys.db
+        .prepare('UPDATE ticket_metadata SET revoked = 1 WHERE id = ?')
+        .run(queued.ticket.id);
+    },
+    'ticket_revoked',
+  ],
+  [
+    'invalid envelope',
+    (f, queued) => {
+      f.store.db
+        .prepare('UPDATE tickets SET envelope = ? WHERE id = ?')
+        .run(
+          JSON.stringify({ ...queued.envelope, ciphertext: '***' }),
+          queued.ticket.id,
+        );
+    },
+    'writer_failed',
+  ],
+  [
+    'tampered envelope',
+    (f, queued) => {
+      const ciphertext = Buffer.from(queued.envelope.ciphertext, 'base64url');
+      ciphertext[ciphertext.length - 1] ^= 1;
+      f.store.db.prepare('UPDATE tickets SET envelope = ? WHERE id = ?').run(
+        JSON.stringify({
+          ...queued.envelope,
+          ciphertext: ciphertext.toString('base64url'),
+        }),
+        queued.ticket.id,
+      );
+    },
+    'writer_failed',
+  ],
+  [
+    'corrupt encrypted private key',
+    (f, queued) => {
+      f.keys.db
+        .prepare('UPDATE private_keys SET encrypted_key = ? WHERE id = ?')
+        .run('{', queued.ticket.id);
+    },
+    'writer_failed',
+  ],
+  [
+    'invalid payload',
+    (f, queued) => {
+      const envelope = encryptRawValue(f.store.get(queued.ticket.id), '  x');
+      f.store.db
+        .prepare('UPDATE tickets SET envelope = ? WHERE id = ?')
+        .run(JSON.stringify(envelope), queued.ticket.id);
+    },
+    'invalid_payload',
+  ],
+]) {
+  test(`pending ${label} still fails and deletes the key`, async (t) => {
+    const f = await retryFixture(t);
+    const vault = new MockVaultAdapter();
+    const write = t.mock.method(vault, 'write');
+    const instance = await writer(f, vault, { pruneIntervalMs: 600000 });
+    const queued = await queue(f);
+    arrange(f, queued);
+    const retry = t.mock.method(f.store, 'retry');
+
+    await instance.drain();
+    const state = f.store.getState(queued.ticket.id);
+    assert.equal(state.status, 'failed');
+    assert.equal(state.failureCode, code);
+    assert.equal(state.envelope, null);
+    assert.equal(state.attempts, 0);
+    assert.equal(state.nextAttemptAt, 0);
+    assert.equal(f.keys.get(queued.ticket.id), undefined);
+    assert.equal(retry.mock.callCount(), 0);
+    assert.equal(write.mock.callCount(), 0);
+    assert.equal(vault.entries.length, 0);
+  });
+}
+
+test('non-VaultError from adapter.write still fails the pending ticket', async (t) => {
+  const f = await retryFixture(t);
+  const vault = new MockVaultAdapter();
+  const write = t.mock.method(vault, 'write', () => {
+    throw new Error('boom');
+  });
+  const instance = await writer(f, vault, { pruneIntervalMs: 600000 });
+  const queued = await queue(f);
+
+  await instance.drain();
+  const state = f.store.getState(queued.ticket.id);
+  assert.equal(state.status, 'failed');
+  assert.equal(state.failureCode, 'writer_failed');
+  assert.equal(state.envelope, null);
+  assert.equal(f.keys.get(queued.ticket.id), undefined);
+  assert.equal(write.mock.callCount(), 1);
+  assert.equal(vault.entries.length, 0);
+});
+
+for (const code of [
+  'ticket_revoked',
+  'ticket_upgrade_required',
+  'invalid_payload',
+  'ticket_expired',
+  'ticket_metadata_mismatch',
+  'invalid_envelope',
+]) {
+  test(`unknown ticket still fails after deterministic ${code}`, async (t) => {
+    const f = await retryFixture(t);
+    const now = Date.now();
+    const vault = new MockVaultAdapter();
+    const lookup = t.mock.method(vault, 'lookup');
+    const write = t.mock.method(vault, 'write');
+    const instance = await writer(f, vault, { now: () => now });
+    const queued = await queue(f);
+    f.store.retry(queued.ticket.id, 'vault_network', {
+      now: now - 5000,
+      unknown: true,
+    });
+    t.mock.method(
+      f.keys,
+      'getMetadata',
+      () => {
+        throw new IntakeError(code);
+      },
+      { times: 1 },
+    );
+
+    await instance.drain();
+    const state = f.store.getState(queued.ticket.id);
+    assert.equal(state.status, 'failed');
+    assert.equal(
+      state.failureCode,
+      ['ticket_metadata_mismatch', 'invalid_envelope'].includes(code)
+        ? 'writer_failed'
+        : code,
+    );
+    assert.equal(state.envelope, null);
+    assert.equal(f.keys.get(queued.ticket.id), undefined);
+    assert.equal(lookup.mock.callCount(), 0);
+    assert.equal(write.mock.callCount(), 0);
+    assert.equal(vault.entries.length, 0);
+  });
+}
+
+test('unknown ticket with bad AAD fails terminally and sends one failure notification', async (t) => {
+  const f = await retryFixture(t);
+  let now = Date.now();
+  const vault = new MockVaultAdapter();
+  const lookup = t.mock.method(vault, 'lookup');
+  const write = t.mock.method(vault, 'write');
+  write.mock.mockImplementationOnce(ambiguousWrite);
+  const notifications = [];
+  const instance = await writer(f, vault, {
+    now: () => now,
+    notifyOff: false,
+    notifier: {
+      async send(ticket) {
+        notifications.push(ticket);
+        return {
+          status: 'sent',
+          attempts: 1,
+          error: null,
+          notifiedAt: new Date(now).toISOString(),
+        };
+      },
+    },
+  });
+  const queued = await queue(f);
+  await instance.drain();
+  const ambiguous = f.store.getState(queued.ticket.id);
+  assert.equal(ambiguous.status, 'unknown');
+  assert.equal(ambiguous.failureCode, 'vault_network');
+  assert.equal(notifications.length, 0);
+
+  const envelope = await encryptValue(
+    { ...queued.ticket, purpose: 'Different purpose' },
+    privateValue,
+  );
+  f.store.db
+    .prepare('UPDATE tickets SET envelope = ? WHERE id = ?')
+    .run(JSON.stringify(envelope), queued.ticket.id);
+  now = ambiguous.nextAttemptAt;
+  const retry = t.mock.method(f.store, 'retry');
+  await instance.drain();
+  const failed = f.store.getState(queued.ticket.id);
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.failureCode, 'writer_failed');
+  assert.equal(failed.envelope, null);
+  assert.equal(failed.attempts, ambiguous.attempts);
+  assert.equal(f.keys.get(queued.ticket.id), undefined);
+  await waitFor(
+    () => f.store.getState(queued.ticket.id).notifyStatus === 'sent',
+  );
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].status, 'failed');
+  assert.equal(notifications[0].failureCode, 'writer_failed');
+  assert.equal(notifications[0].envelope, null);
+  assert(
+    !JSON.stringify({ notifications, logs: f.logs }).includes(privateValue),
+  );
+
+  now += 300000;
+  await instance.drain();
+  assert.equal(f.store.getState(queued.ticket.id).status, 'failed');
+  assert.equal(retry.mock.callCount(), 0);
+  assert.equal(lookup.mock.callCount(), 0);
+  assert.equal(write.mock.callCount(), 1);
+  assert.equal(vault.entries.length, 0);
+  assert.equal(notifications.length, 1);
+});
+
+for (const [corruption, corrupt] of [
+  [
+    'tampered envelope',
+    (f, queued) => {
+      const ciphertext = Buffer.from(queued.envelope.ciphertext, 'base64url');
+      ciphertext[ciphertext.length - 1] ^= 1;
+      f.store.db.prepare('UPDATE tickets SET envelope = ? WHERE id = ?').run(
+        JSON.stringify({
+          ...queued.envelope,
+          ciphertext: ciphertext.toString('base64url'),
+        }),
+        queued.ticket.id,
+      );
+    },
+  ],
+  [
+    'corrupt encrypted private key',
+    (f, queued) => {
+      f.keys.db
+        .prepare('UPDATE private_keys SET encrypted_key = ? WHERE id = ?')
+        .run('{', queued.ticket.id);
+    },
+  ],
+  [
+    'corrupt target_json',
+    (f, queued) => {
+      f.keys.db
+        .prepare('UPDATE ticket_metadata SET target_json = ? WHERE id = ?')
+        .run('{', queued.ticket.id);
+    },
+  ],
+]) {
+  test(`unknown ticket terminates after ${corruption} without retrying`, async (t) => {
+    const f = await retryFixture(t);
+    let now = Date.now();
+    const vault = new MockVaultAdapter();
+    const lookup = t.mock.method(vault, 'lookup');
+    const write = t.mock.method(vault, 'write');
+    const instance = await writer(f, vault, { now: () => now });
+    const queued = await queue(f);
+    f.store.retry(queued.ticket.id, 'vault_network', {
+      now: now - 5000,
+      unknown: true,
+    });
+    corrupt(f, queued);
+    const fail = t.mock.method(f.store, 'fail');
+    const retry = t.mock.method(f.store, 'retry');
+
+    for (let drain = 0; drain < 2; drain += 1) {
+      await instance.drain();
+      const state = f.store.getState(queued.ticket.id);
+      assert.equal(state.status, 'failed');
+      assert.equal(state.failureCode, 'writer_failed');
+      assert.equal(state.envelope, null);
+      assert.equal(state.attempts, 1);
+      assert.equal(f.keys.get(queued.ticket.id), undefined);
+      assert.equal(fail.mock.callCount(), 1);
+      assert.equal(retry.mock.callCount(), 0);
+      assert.equal(lookup.mock.callCount(), 0);
+      assert.equal(write.mock.callCount(), 0);
+      assert.equal(vault.entries.length, 0);
+      now += 10001;
+    }
+  });
+}
+
+test('unknown ticket fails on a generic write error after an empty recovery lookup', async (t) => {
+  const f = await retryFixture(t);
+  const now = Date.now();
+  const vault = new MockVaultAdapter();
+  const lookup = t.mock.method(vault, 'lookup');
+  const write = t.mock.method(vault, 'write', () => {
+    throw new Error('simulated_write_failure');
+  });
+  const instance = await writer(f, vault, { now: () => now });
+  const queued = await queue(f);
+  f.store.retry(queued.ticket.id, 'vault_network', {
+    now: now - 5000,
+    unknown: true,
+  });
+
+  await instance.drain();
+  const state = f.store.getState(queued.ticket.id);
+  assert.equal(state.status, 'failed');
+  assert.equal(state.failureCode, 'writer_failed');
+  assert.equal(state.envelope, null);
+  assert.equal(f.keys.get(queued.ticket.id), undefined);
+  assert.equal(lookup.mock.callCount(), 1);
+  assert.equal(await lookup.mock.calls[0].result, null);
+  assert.equal(write.mock.callCount(), 1);
+  assert.equal(vault.entries.length, 0);
+});
 
 for (const unix of [false, true]) {
   const transport = unix ? 'Unix' : 'HTTP';
@@ -307,12 +1374,16 @@ for (const [kind, code] of [
     }
     const socketPath = join(parent, 'vault.sock');
     if (kind === 'refused') {
-      await execute(process.execPath, [
-        '--input-type=module',
-        '-e',
-        "import { createServer } from 'node:net'; createServer().listen(process.argv[1], () => process.exit(0));",
-        socketPath,
-      ]);
+      await execute(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          "import { createServer } from 'node:net'; createServer().listen(process.argv[1], () => process.exit(0));",
+          socketPath,
+        ],
+        { env: {} },
+      );
       assert((await lstat(socketPath)).isSocket());
     } else if (kind === 'denied parent') await chmod(parent, 0o000);
     else await assert.rejects(lstat(socketPath), { code: 'ENOENT' });

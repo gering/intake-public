@@ -12,8 +12,38 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { IntakeError } from './errors.js';
 
 const operationalFsCodes = new Set(['ENOENT', 'EACCES', 'EPERM']);
+const databaseIoCodes = new Set([
+  'ENOSPC',
+  'EMFILE',
+  'ENFILE',
+  'EROFS',
+  'EIO',
+  'SQLITE_FULL',
+  'SQLITE_IOERR',
+  'SQLITE_CANTOPEN',
+  'SQLITE_NOMEM',
+  'SQLITE_READONLY',
+]);
 
-function isDatabaseLockError(error) {
+function isDatabaseIoError(error) {
+  if (
+    !(error instanceof Error) ||
+    error instanceof IntakeError ||
+    error.code === 'SQLITE_READONLY_DBMOVED' ||
+    error.code === 'SQLITE_CANTOPEN_SYMLINK' ||
+    error.code === 'SQLITE_CANTOPEN_DIRTYWAL'
+  )
+    return false;
+  return (
+    databaseIoCodes.has(error.code) ||
+    (typeof error.code === 'string' &&
+      (error.code.startsWith('SQLITE_IOERR_') ||
+        error.code.startsWith('SQLITE_CANTOPEN_') ||
+        error.code.startsWith('SQLITE_READONLY_')))
+  );
+}
+
+export function isDatabaseLockError(error) {
   return (
     typeof error?.code === 'string' &&
     (error.code.startsWith('SQLITE_BUSY') ||
@@ -32,9 +62,11 @@ export function databaseFailure(error) {
     error instanceof IntakeError &&
     (error.code === 'unsafe_database' ||
       error.code === 'unsafe_database_permissions' ||
-      error.code === 'database_unavailable')
+      error.code === 'database_unavailable' ||
+      error.code === 'database_io_error')
   )
     return error;
+  if (isDatabaseIoError(error)) return new IntakeError('database_io_error');
   if (isOperationalDatabaseError(error))
     return new IntakeError('database_unavailable');
   return new IntakeError('unsafe_database');
@@ -98,7 +130,7 @@ function sameFile(left, right) {
 
 function validateIdentity(db, path, mode, original) {
   // Once the handle is open, a missing or unreadable file is tampering.
-  // Lock errors stay operational so the caller can still map them.
+  // Resource, I/O and lock errors stay operational so the caller can map them.
   try {
     validateParent(path, mode);
     const current = validateFiles(path, mode);
@@ -114,7 +146,12 @@ function validateIdentity(db, path, mode, original) {
     )
       throw new IntakeError('unsafe_database');
   } catch (error) {
-    if (error instanceof IntakeError || isDatabaseLockError(error)) throw error;
+    if (
+      error instanceof IntakeError ||
+      isDatabaseLockError(error) ||
+      isDatabaseIoError(error)
+    )
+      throw error;
     throw new IntakeError('unsafe_database');
   }
 }

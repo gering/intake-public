@@ -302,6 +302,11 @@ for (const [option, values, code] of [
     'invalid_intake_expiry_grace_ms',
   ],
   [
+    'shutdownWaitMs',
+    [-1, 1.5, NaN, Infinity, 2147483648, 9007199254740992, '100', null],
+    'invalid_intake_shutdown_wait_ms',
+  ],
+  [
     'pruneIntervalMs',
     [0, -1, 1.5, NaN, Infinity, 2147483648],
     'invalid_intake_prune_interval_ms',

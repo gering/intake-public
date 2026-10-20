@@ -125,6 +125,16 @@ export function loadConfig(env = process.env, role = 'web') {
     });
   }
   if (role === 'writer') {
+    config.shutdownWaitMs =
+      env.INTAKE_SHUTDOWN_WAIT_MS === undefined
+        ? 5000
+        : Number(env.INTAKE_SHUTDOWN_WAIT_MS);
+    if (
+      !Number.isSafeInteger(config.shutdownWaitMs) ||
+      config.shutdownWaitMs < 0 ||
+      config.shutdownWaitMs > 2147483647
+    )
+      throw new IntakeError('invalid_intake_shutdown_wait_ms');
     config.unknownSettleMs = positive(env, 'INTAKE_UNKNOWN_SETTLE_MS', 120000);
     config.vaultRetryBaseMs = positive(env, 'INTAKE_VAULT_RETRY_BASE_MS', 5000);
     config.vaultRetryMaxMs = positive(env, 'INTAKE_VAULT_RETRY_MAX_MS', 300000);

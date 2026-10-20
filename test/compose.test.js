@@ -204,7 +204,7 @@ test('Docker targets pin runtime versions and initialize non-root volume metadat
     ),
   );
   const bwDeps = dockerfile
-    .split('FROM build-tools AS bw-deps\n')[1]
+    .split('FROM base AS bw-deps\n')[1]
     ?.split('\nFROM ')[0];
   assert(bwDeps.includes('RUN npm ci --omit=dev --ignore-scripts'));
   assert(!dockerfile.includes('npm i -g'));

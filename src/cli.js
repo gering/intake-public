@@ -11,11 +11,12 @@ const help = `Usage:
   intake create --key-name NAME --purpose TEXT --target-item NAME --target-field NAME
     [--target-notes TEXT] [--ttl 24h] [--notify-email ops@example.com] [--keep-whitespace]
   intake list
-  intake show <id>
-  intake revoke <id>
+  intake show -- <id>
+  intake revoke -- <id>
   intake purge [--older-than-days 30]
-  intake notify-retry <id>
+  intake notify-retry -- <id>
 
+Use -- before ticket IDs; IDs starting with '-' are otherwise parsed as options.
 Creation prints a one-time link exactly once. Preserve it privately; it cannot be recovered.
 Every ticket requires a notification address (or INTAKE_DEFAULT_NOTIFY_EMAIL).
 Values are trimmed in the browser by default; --keep-whitespace preserves them exactly.

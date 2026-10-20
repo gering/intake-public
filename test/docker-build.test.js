@@ -11,6 +11,7 @@ const read = (name) => readFile(join(root, name), 'utf8');
 // An existing ignored/untracked local file must not satisfy a clean-checkout COPY.
 const files = execFileSync('git', ['ls-files', '--cached', '-z'], {
   cwd: root,
+  env: { PATH: process.env.PATH },
   encoding: 'utf8',
 })
   .split('\0')
@@ -250,20 +251,25 @@ test('Every local COPY exists in a clean checkout and is retained by .dockerigno
 test('bw installs integrity-locked CLI dependencies without lifecycle scripts', async () => {
   const manifest = JSON.parse(await read('docker/bw/package.json'));
   const lock = JSON.parse(await read('docker/bw/package-lock.json'));
+  const cliVersion = manifest.dependencies['@bitwarden/cli'];
+  const multerVersion = manifest.overrides['@bitwarden/cli'].multer;
+  const tmpVersion = manifest.overrides['external-editor'].tmp;
+  for (const version of [cliVersion, multerVersion, tmpVersion])
+    assert.match(version, /^\d+\.\d+\.\d+$/);
   assert.equal(manifest.private, true);
-  assert.deepEqual(manifest.dependencies, { '@bitwarden/cli': '2026.9.1' });
+  assert.deepEqual(manifest.dependencies, { '@bitwarden/cli': cliVersion });
   assert.deepEqual(manifest.overrides, {
-    '@bitwarden/cli': { multer: '2.4.0' },
-    'external-editor': { tmp: '0.2.7' },
+    '@bitwarden/cli': { multer: multerVersion },
+    'external-editor': { tmp: tmpVersion },
   });
   assert.equal(lock.lockfileVersion, 3);
   assert.deepEqual(lock.packages[''].dependencies, manifest.dependencies);
   assert.equal(
     lock.packages['node_modules/@bitwarden/cli'].version,
-    '2026.9.1',
+    cliVersion,
   );
-  assert.equal(lock.packages['node_modules/multer'].version, '2.4.0');
-  assert.equal(lock.packages['node_modules/tmp'].version, '0.2.7');
+  assert.equal(lock.packages['node_modules/multer'].version, multerVersion);
+  assert.equal(lock.packages['node_modules/tmp'].version, tmpVersion);
   for (const [path, entry] of Object.entries(lock.packages)) {
     if (!path) continue;
     assert.match(entry.resolved, /^https:\/\/registry\.npmjs\.org\//);
@@ -289,35 +295,60 @@ test('bw installs integrity-locked CLI dependencies without lifecycle scripts', 
         op === 'RUN' && args === 'npm ci --omit=dev --ignore-scripts',
     ),
   );
-  const appDependencies = stages.find(({ name }) => name === 'app-deps');
+});
+
+test('app installs the reviewed bundled SQLite prebuilds and smoke-tests loading them', async () => {
+  const lock = JSON.parse(await read('package-lock.json'));
+  const sqlite = lock.packages['node_modules/better-sqlite3'];
+  assert.equal(
+    sqlite.version,
+    '13.0.3',
+    'Recheck bundled prebuilds and Node-API/glibc compatibility on upgrades',
+  );
+  assert.deepEqual(sqlite.dependencies, { 'node-addon-api': '^8.0.0' });
+  const dependencies = stages.find(({ name }) => name === 'app-deps');
   assert(
-    appDependencies.instructions.some(
-      ({ op, args }) => op === 'RUN' && args === 'npm ci --omit=dev',
+    dependencies.instructions.some(
+      ({ op, args }) =>
+        op === 'RUN' &&
+        args.replace(/\s+/g, ' ') ===
+          `npm ci --omit=dev --ignore-scripts && node -e "require('better-sqlite3')(':memory:').close()"`,
     ),
   );
 });
 
-test('python3, make and g++ occur only in build stages, not runtime ancestry', () => {
-  const installed = stages
-    .flatMap((stage) => stage.instructions)
-    .filter(({ op }) => op === 'RUN')
-    .flatMap(({ args }) => [
-      ...args.matchAll(/\bapt-get\s+install\s+([^;&|]+)/g),
-    ])
-    .flatMap((match) => match[1].trim().split(/\s+/));
-  for (const tool of ['python3', 'make', 'g++'])
-    assert(installed.includes(tool), `Build stage must install ${tool}`);
-  const tools = /(?:^|[^\w.-])(?:python3|make|g\+\+)(?=$|[^\w+.-])/;
-  for (const [, service] of services) {
-    let stage = stages.find((stage) => stage.name === service.build.target);
-    for (; stage; stage = stage.parent)
-      for (const { op, args } of stage.instructions)
-        if (op === 'RUN' || op === 'COPY')
-          assert(
-            !tools.test(args),
-            `Runtime inherits native toolchain: ${stage.name}`,
-          );
+test('every dependency-stage npm ci disables explicit and implicit lifecycle scripts', () => {
+  // binding.gyp can trigger npm's default node-gyp rebuild even when the lock
+  // omits hasInstallScript. Require script suppression for every install in
+  // these toolchain-free stages, independently of that incomplete metadata.
+  for (const stage of stages.filter(({ name }) => name.endsWith('-deps'))) {
+    const installs = stage.instructions.flatMap(({ op, args }) =>
+      op === 'RUN' ? [...args.matchAll(/\bnpm\s+ci\b([^;&|]*)/g)] : [],
+    );
+    assert(installs.length, `Missing dependency install: ${stage.name}`);
+    for (const [, flags] of installs)
+      assert.match(
+        flags,
+        /(?:^|\s)--ignore-scripts(?:\s|$)/,
+        `${stage.name}: npm ci must suppress explicit scripts and binding.gyp rebuilds`,
+      );
   }
+});
+
+test('dependency and runtime stages do not install or inherit native toolchains', () => {
+  for (const name of ['app-deps', 'bw-deps'])
+    assert.equal(
+      stages.find((stage) => stage.name === name).parent.name,
+      'base',
+    );
+  const tools = /(?:^|[^\w.-])(?:python3|make|g\+\+)(?=$|[^\w+.-])/;
+  for (const stage of stages)
+    for (const { op, args } of stage.instructions)
+      if (op === 'RUN' || op === 'COPY')
+        assert(
+          !tools.test(args),
+          `Stage installs native toolchain: ${stage.name}`,
+        );
 });
 
 test('COPY validation catches missing/ignored inputs and supports package manifest globs', () => {

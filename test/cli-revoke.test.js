@@ -14,12 +14,10 @@ const deferred =
 
 function operatorEnv(f) {
   return {
-    ...process.env,
     INTAKE_DB: f.config.dbPath,
     INTAKE_SOCKET: f.config.socketPath,
     INTAKE_IPC_TIMEOUT_MS: '1000',
     INTAKE_HMAC_KEY: f.config.hmacKey.toString('base64'),
-    INTAKE_HMAC_KEY_FILE: '',
     INTAKE_PRIVATE_DB: '/unreadable/private.sqlite',
     INTAKE_WRITER_KEY_FILE: '/unreadable/writer.key',
     INTAKE_FINGERPRINT_KEY_FILE: '/unreadable/fingerprint.key',

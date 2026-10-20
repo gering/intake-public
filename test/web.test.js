@@ -184,7 +184,10 @@ test('per-ticket and per-IP HTTP rate limits return 429 with security headers', 
   const rejected = await post(f.base, '/api/open', { token: wrongToken });
   assert.equal(rejected.status, 400);
   assert.deepEqual(await rejected.json(), { error: 'ticket_unavailable' });
-  const limited = await post(f.base, '/api/submit', { token, envelope: {} });
+  const limited = await post(f.base, '/api/submit', {
+    token: wrongToken,
+    envelope: {},
+  });
   assert.equal(limited.status, 429);
   checkHeaders(limited);
   assert.deepEqual(await limited.json(), { error: 'rate_limited' });

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import { createServer } from 'node:http';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
 import { readFile, stat, symlink, chmod, writeFile } from 'node:fs/promises';
@@ -30,7 +31,7 @@ const createArgs = [
 
 function cliEnv(f) {
   return {
-    ...process.env,
+    PATH: process.env.PATH,
     INTAKE_DB: f.config.dbPath,
     INTAKE_PRIVATE_DB: f.config.privateDbPath,
     INTAKE_SOCKET: f.config.socketPath,
@@ -39,8 +40,6 @@ function cliEnv(f) {
     INTAKE_FINGERPRINT_KEY_FILE: f.config.fingerprintKeyFile,
     INTAKE_PUBLIC_URL: 'https://intake.example.com',
     INTAKE_DEFAULT_NOTIFY_EMAIL: 'ops@example.com',
-    INTAKE_HMAC_KEY_FILE: '',
-    INTAKE_WRITER_KEY_FILE: '',
   };
 }
 
@@ -62,6 +61,46 @@ async function invoke(args, env) {
   });
   return { code, stdout, stderr };
 }
+
+test('CLI subprocesses receive only explicit fixture configuration and PATH', async (t) => {
+  const f = await fixture(t);
+  const inherited = {
+    INTAKE_MAX_TTL: '1m',
+    INTAKE_HMAC_KEY_FILE: join(f.dir, 'missing-hmac.key'),
+    INTAKE_WRITER_KEY_FILE: join(f.dir, 'missing-writer.key'),
+    NODE_OPTIONS: '--invalid-test-node-option',
+    BW_SESSION: 'parent-test-session',
+    MAIL_API_TOKEN: 'parent-test-mail-token',
+    UNRELATED_TEST_SECRET: 'parent-test-secret',
+  };
+  const previous = new Map(
+    Object.keys(inherited).map((name) => [name, process.env[name]]),
+  );
+  t.after(() => {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+  Object.assign(process.env, inherited);
+  const env = cliEnv(f);
+  for (const name of Object.keys(inherited)) assert(!Object.hasOwn(env, name));
+  const child = await execute(
+    process.execPath,
+    ['-e', 'process.stdout.write(JSON.stringify(process.env))'],
+    { env },
+  );
+  assert.equal(child.stderr, '');
+  assert.deepEqual(JSON.parse(child.stdout), env);
+  const created = await execute(process.execPath, [cliPath, ...createArgs], {
+    env,
+  });
+  assert.equal(created.stderr, '');
+  assert.match(
+    created.stdout,
+    /^https:\/\/intake\.example\.com\/#req=[\w-]{22}\.[\w-]{43}\n$/,
+  );
+});
 
 test('actual CLI prints one creation link, lists without tokens, revokes and purges', async (t) => {
   const f = await fixture(t);
@@ -230,7 +269,13 @@ test('help needs no credentials and error output never echoes raw filesystem err
   const f = await fixture(t);
   const help = await invoke(['--help'], {});
   assert.equal(help.code, 0);
-  assert(help.stdout.includes('notify-retry'));
+  for (const command of ['show', 'revoke', 'notify-retry'])
+    assert(help.stdout.includes(`intake ${command} -- <id>`));
+  assert(
+    help.stdout.includes(
+      "IDs starting with '-' are otherwise parsed as options.",
+    ),
+  );
   const env = {
     ...cliEnv(f),
     INTAKE_DB: join(f.dir, 'missing-private-directory/tickets.sqlite'),
@@ -240,6 +285,77 @@ test('help needs no credentials and error output never echoes raw filesystem err
   assert.equal(result.stderr, 'intake: database_unavailable\n');
   assert(!result.stderr.includes(f.dir));
 });
+
+for (const prefix of ['-', '--']) {
+  test(`CLI accepts a ${prefix.length}-dash-leading ticket ID after -- and rejects it safely without --`, async (t) => {
+    const f = await fixture(t);
+    const { ticket } = f.create();
+    const id = prefix + 'A'.repeat(22 - prefix.length);
+    f.store.db
+      .prepare('UPDATE tickets SET id = ? WHERE id = ?')
+      .run(id, ticket.id);
+    const requests = [];
+    const server = createServer((req, res) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => {
+        body += chunk;
+      });
+      req.on('end', () => {
+        requests.push({ path: req.url, body: JSON.parse(body) });
+        if (req.url === '/notify-retry') f.store.retryNotification(id);
+        res.end('{}');
+      });
+    });
+    await new Promise((resolve) => server.listen(f.config.socketPath, resolve));
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    const env = cliEnv(f);
+
+    for (const command of ['show', 'revoke', 'notify-retry']) {
+      await assert.rejects(
+        execute(process.execPath, [cliPath, command, id], { env }),
+        { code: 1, stdout: '', stderr: 'intake: invalid_arguments\n' },
+      );
+    }
+    assert.equal(f.store.get(id).status, 'active');
+    assert.deepEqual(requests, []);
+
+    const shown = await execute(process.execPath, [cliPath, 'show', '--', id], {
+      env,
+    });
+    assert.equal(shown.stderr, '');
+    assert(shown.stdout.includes(`\n${id}\t${ticket.keyName}\tactive\t`));
+    const revoked = await execute(
+      process.execPath,
+      [cliPath, 'revoke', '--', id],
+      { env },
+    );
+    assert.equal(revoked.stderr, '');
+    assert.equal(revoked.stdout, 'Ticket revoked. Private key removed.\n');
+    assert.equal(f.store.get(id).status, 'revoked');
+
+    f.store.db
+      .prepare(
+        "UPDATE tickets SET status = 'done', notify_status = 'failed' WHERE id = ?",
+      )
+      .run(id);
+    const retried = await execute(
+      process.execPath,
+      [cliPath, 'notify-retry', '--', id],
+      { env },
+    );
+    assert.equal(retried.stderr, '');
+    assert.equal(
+      retried.stdout,
+      'Notification retry queued. Check intake list for the result.\n',
+    );
+    assert.equal(f.store.getState(id).notifyStatus, 'pending');
+    assert.deepEqual(requests, [
+      { path: '/revoke', body: { id } },
+      { path: '/notify-retry', body: { id } },
+    ]);
+  });
+}
 
 test('web and writer entrypoints refuse uid 0 before accessing configuration or resources', async (t) => {
   const logs = [];

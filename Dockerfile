@@ -1,14 +1,11 @@
 FROM node:22.23.3-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS base
 
-FROM base AS build-tools
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 make g++ \
-    && rm -rf /var/lib/apt/lists/*
-
-FROM build-tools AS app-deps
+FROM base AS app-deps
 WORKDIR /build
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# Use bundled Node-API prebuilds, not npm's implicit binding.gyp rebuild.
+RUN npm ci --omit=dev --ignore-scripts \
+    && node -e "require('better-sqlite3')(':memory:').close()"
 
 FROM base AS app
 ENV NODE_ENV=production
@@ -39,7 +36,7 @@ USER 10002:10010
 ENTRYPOINT ["/usr/local/bin/intake-writer"]
 CMD ["node", "src/writer-main.js"]
 
-FROM build-tools AS bw-deps
+FROM base AS bw-deps
 WORKDIR /build/bw
 COPY docker/bw/package.json docker/bw/package-lock.json ./
 # No native addons; the pinned tree's only lifecycle script is a core-js banner.

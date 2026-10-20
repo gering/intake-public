@@ -35,7 +35,7 @@ test('container probes reach web and writer without ticket data or mutations', a
   await checkHealth('web', { PORT: web.server.address().port });
   await checkHealth('writer', { INTAKE_SOCKET: f.config.socketPath });
   const response = await execute(process.execPath, [script, 'writer'], {
-    env: { ...process.env, INTAKE_SOCKET: f.config.socketPath },
+    env: { INTAKE_SOCKET: f.config.socketPath },
   });
   assert.equal(response.stdout, '');
   assert.equal(response.stderr, '');
@@ -82,7 +82,7 @@ test('vault health requires an unlocked status envelope and sends the allowed Ho
   await assert.rejects(checkHealth('bw', env));
   await assert.rejects(
     execute(process.execPath, [script, 'bw'], {
-      env: { ...process.env, ...env },
+      env,
     }),
     { code: 1, stdout: '', stderr: '' },
   );

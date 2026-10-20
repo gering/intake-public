@@ -1,0 +1,30 @@
+name: Docker
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build web image
+        run: docker build --target web --tag intake-web:ci .
+      - name: Build writer image
+        run: docker build --target writer --tag intake-writer:ci .
+      - name: Build vault image
+        run: docker build --target bw --tag intake-bw:ci .
+      - name: Smoke-test Node in app images
+        run: |
+          docker run --rm --network none --entrypoint node intake-web:ci --version
+          docker run --rm --network none --entrypoint node intake-writer:ci --version
+      - name: Smoke-test vault CLI
+        run: docker run --rm --network none --entrypoint bw intake-bw:ci --version
