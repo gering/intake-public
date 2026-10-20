@@ -142,8 +142,12 @@ networks:
   tunnel:
     external: true
     name: ${INTAKE_TUNNEL_NETWORK:-intake-tunnel}
+  # Pinned so Docker never auto-assigns a range that overlaps the host's LAN.
   egress:
     driver: bridge
+    ipam:
+      config:
+        - subnet: ${INTAKE_EGRESS_SUBNET:-10.200.176.0/24}
 
 volumes:
   intake-sock:

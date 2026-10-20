@@ -97,7 +97,10 @@ test('Compose isolates web networking and waits for unlocked vault and ready wri
     stack.networks.tunnel.name,
     '${INTAKE_TUNNEL_NETWORK:-intake-tunnel}',
   );
-  assert.deepEqual(stack.networks.egress, { driver: 'bridge' });
+  assert.deepEqual(stack.networks.egress, {
+    driver: 'bridge',
+    ipam: { config: [{ subnet: '${INTAKE_EGRESS_SUBNET:-10.200.176.0/24}' }] },
+  });
   assert.deepEqual(stack.services.web.expose, ['3000']);
   assert.equal(stack.services.web.environment.INTAKE_HOST, '0.0.0.0');
   assert.equal(

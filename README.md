@@ -695,6 +695,13 @@ Existing volumes are **not repaired** by rebuilding an image: inspect ownership
 and provision/migrate them offline before starting. Do not add an unconditional
 root startup script or weaken the writer's private vault-parent check.
 
+The `egress` bridge uses the subnet `INTAKE_EGRESS_SUBNET`, default
+**`10.200.176.0/24`**, instead of a Docker-assigned range, which can overlap the
+host's LAN (e.g. a home router LAN in 192.168.x.0/24) and cut the host off from
+it. Choose a subnet that overlaps no network the host must reach. Docker does not
+change an existing network's subnet; run `docker compose down` before `up` to
+recreate it.
+
 The external network name comes from `INTAKE_TUNNEL_NETWORK`. Keep only web and
 trusted tunnel connectors on it; do not attach unrelated services or the vault
 API. Web has no application need for outbound Internet access, but a normal
