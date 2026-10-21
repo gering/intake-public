@@ -14,7 +14,9 @@ export function createTicketKeys(masterKey, id) {
     modulusLength: 3072,
   });
   const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', masterKey, iv);
+  const cipher = createCipheriv('aes-256-gcm', masterKey, iv, {
+    authTagLength: 16,
+  });
   cipher.setAAD(Buffer.from(id));
   const der = privateKey.export({ type: 'pkcs8', format: 'der' });
   try {
@@ -66,6 +68,7 @@ export function decryptValue(masterKey, ticket, encryptedPrivateKey, envelope) {
     'aes-256-gcm',
     masterKey,
     Buffer.from(encrypted.iv, 'base64url'),
+    { authTagLength: 16 },
   );
   decipher.setAAD(Buffer.from(ticket.id));
   decipher.setAuthTag(Buffer.from(encrypted.tag, 'base64url'));
@@ -88,7 +91,9 @@ export function decryptValue(masterKey, ticket, encryptedPrivateKey, envelope) {
       wrappedKey,
     );
     if (aesKey.length !== 32) throw new IntakeError('invalid_envelope');
-    const aes = createDecipheriv('aes-256-gcm', aesKey, iv);
+    const aes = createDecipheriv('aes-256-gcm', aesKey, iv, {
+      authTagLength: 16,
+    });
     aes.setAAD(aadBytes(ticket));
     aes.setAuthTag(ciphertext.subarray(-16));
     plaintext = Buffer.concat([

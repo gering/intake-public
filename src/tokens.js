@@ -18,6 +18,7 @@ export function parseToken(token) {
   // Reject alternative encodings of the same bytes.
   if (
     Buffer.from(id, 'base64url').toString('base64url') !== id ||
+    // nosemgrep: ajinabraham.njsscan.generic.hardcoded_secrets.node_secret -- compares the parsed token part with its canonical base64url form; no literal secret.
     Buffer.from(secret, 'base64url').toString('base64url') !== secret
   )
     return null;
