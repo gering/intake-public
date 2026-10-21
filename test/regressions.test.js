@@ -189,7 +189,7 @@ test('real SQLite contention recovers processing as unknown without immediate re
   assert.equal(writes, 1);
 });
 
-test('writer decryption rejects a truncated private-key authentication tag', async (t) => {
+test('writer decryption rejects truncated private-key authentication tags', async (t) => {
   const f = await fixture(t);
   const { ticket } = f.create();
   const envelope = await encryptValue(ticket, 'private-value');
@@ -197,13 +197,17 @@ test('writer decryption rejects a truncated private-key authentication tag', asy
   const tag = Buffer.from(stored.tag, 'base64url');
   assert.equal(tag.length, 16);
   // GCM accepts any prefix of the real tag unless the expected length is pinned.
-  const truncated = JSON.stringify({
-    ...stored,
-    tag: tag.subarray(0, 12).toString('base64url'),
-  });
-  assert.throws(() =>
-    decryptValue(f.config.masterKey, ticket, truncated, envelope),
-  );
+  for (const length of [4, 8, 12, 15]) {
+    const truncated = JSON.stringify({
+      ...stored,
+      tag: tag.subarray(0, length).toString('base64url'),
+    });
+    assert.throws(
+      () => decryptValue(f.config.masterKey, ticket, truncated, envelope),
+      undefined,
+      `tag length ${length}`,
+    );
+  }
   const result = decryptValue(
     f.config.masterKey,
     ticket,
