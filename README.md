@@ -573,7 +573,7 @@ but before recording `sent` can cause a duplicate email.
 Use a Linux Docker Engine with Compose v2 or newer, local named-volume storage
 suitable for SQLite WAL, and an existing trusted HTTPS tunnel connector. This
 stack can run next to an existing Vaultwarden server; it does not deploy or expose
-the vault server itself. The images pin Node `22.23.3-bookworm-slim` by digest and
+the vault server itself. The images pin Node `22.23.4-bookworm-slim` by digest and
 `@bitwarden/cli@2026.10.0`. The bw build installs from committed
 `docker/bw/package.json` and `package-lock.json` with
 `npm ci --omit=dev --ignore-scripts`, including integrity-locked transitive
@@ -699,8 +699,11 @@ The `egress` bridge uses the subnet `INTAKE_EGRESS_SUBNET`, default
 **`10.200.176.0/24`**, instead of a Docker-assigned range, which can overlap the
 host's LAN (e.g. a home router LAN in 192.168.x.0/24) and cut the host off from
 it. Choose a subnet that overlaps no network the host must reach. Docker does not
-change an existing network's subnet; run `docker compose down` before `up` to
-recreate it.
+change an existing network's subnet, so a changed value only applies once the
+network is recreated. A Portainer Git redeploy usually recreates the network on
+its own. If the subnet is still wrong afterwards (check under **Networks**), stop
+the stack, remove the stack's `egress` network and redeploy. With plain Compose,
+run `docker compose down` (without `-v`) before `up`.
 
 The external network name comes from `INTAKE_TUNNEL_NETWORK`. Keep only web and
 trusted tunnel connectors on it; do not attach unrelated services or the vault
@@ -1916,8 +1919,9 @@ unit tests alone does not validate the deployed network/permission boundary.
 
 Run `npm run audit:check` with Node 22 to audit both the root and `docker/bw`
 lockfiles without installing their dependencies. The dependency audit
-also runs in CI on pull requests, pushes to `main`, weekly, and on manual
-request. Unapproved high/critical advisories, expired exceptions, invalid
+also runs as a step of the `CI` / `test` job on pull requests, pushes to
+`main`, weekly, and on manual request; pull requests that only change
+Markdown files or `docs/` skip it (and lint, format and tests). Unapproved high/critical advisories, expired exceptions, invalid
 allowlists and incomplete audit responses fail the check; lower severities are
 reported, and stale exceptions produce warnings.
 
@@ -1927,10 +1931,39 @@ entry requires the exact GHSA `id`, npm `package`, `target` (`root` or
 `YYYY-MM-DD` format. An exception applies only to that target, advisory and
 package; remove it when no longer needed and review it before expiry.
 
-CI also runs Gitleaks with `.gitleaks.toml` to scan for secrets, with fully
-redacted output. Any fixture or documentation exclusion must be narrow,
-commented and reviewed; never allowlist real credentials. Dependabot checks
-GitHub Actions and both npm trees weekly.
+The separate `Security` / `scan` job (`.github/workflows/security.yml`, self-hosted
+`s2` runner) runs on every pull request (including documentation-only ones),
+on pushes to `main`, on manual request and weekly on Mondays at 04:47 UTC,
+normally in under a minute, and
+writes its results to the job summary:
+
+- **Semgrep CE 1.182.0** with the public rule packs `p/javascript`,
+  `p/nodejsscan`, `p/secrets` and `p/docker`, run locally on the runner (no
+  Semgrep login, app token or cloud upload; installed from the hash-pinned
+  `.github/semgrep-requirements.txt`, fresh on every run). ERROR findings and
+  every scan error (rule timeouts, parse errors; `--strict --timeout 60
+--timeout-threshold 3`) fail the job; WARNING and
+  INFO findings are only listed. Semgrep's default ignores apply (`.gitignore`d
+  paths, `node_modules`, `test/`, build output, minified JS); tests hold
+  synthetic credentials and are covered by Gitleaks.
+- **Gitleaks 8.30.1** with `.gitleaks.toml` over the full history (pull
+  requests: the history of the PR merge commit; otherwise all refs), with fully
+  redacted output.
+
+Run them locally (e.g. `uv tool install semgrep==1.182.0`):
+
+```sh
+gitleaks git --redact=100 --config .gitleaks.toml --log-opts="--all --diff-merges=first-parent" .
+semgrep scan --metrics off --config p/javascript --config p/nodejsscan \
+  --config p/secrets --config p/docker --strict --timeout 60 --severity ERROR --error .
+```
+
+For a reviewed Semgrep false positive, add `// nosemgrep: <rule-id> -- <reason>`
+on the line above the finding. The Docker image build runs on pushes to `main`
+and on pull requests that change the Dockerfile, `docker/` or a lockfile. Any
+fixture or documentation exclusion must be narrow, commented and reviewed; never
+allowlist real credentials. Dependabot checks GitHub Actions and both npm trees
+weekly.
 
 ## License
 
