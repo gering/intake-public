@@ -9,7 +9,8 @@
   },
   "overrides": {
     "@bitwarden/cli": {
-      "multer": "2.4.0"
+      "multer": "2.5.0",
+      "node-forge": "1.4.2"
     },
     "external-editor": {
       "tmp": "0.2.7"

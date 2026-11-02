@@ -125,10 +125,12 @@ export function loadConfig(env = process.env, role = 'web') {
     });
   }
   if (role === 'writer') {
+    const shutdownWait = env.INTAKE_SHUTDOWN_WAIT_MS;
+    // Number('') is 0; a blank value must not silently mean "abort immediately".
+    if (shutdownWait !== undefined && String(shutdownWait).trim() === '')
+      throw new IntakeError('invalid_intake_shutdown_wait_ms');
     config.shutdownWaitMs =
-      env.INTAKE_SHUTDOWN_WAIT_MS === undefined
-        ? 5000
-        : Number(env.INTAKE_SHUTDOWN_WAIT_MS);
+      shutdownWait === undefined ? 5000 : Number(shutdownWait);
     if (
       !Number.isSafeInteger(config.shutdownWaitMs) ||
       config.shutdownWaitMs < 0 ||

@@ -253,13 +253,14 @@ test('bw installs integrity-locked CLI dependencies without lifecycle scripts', 
   const lock = JSON.parse(await read('docker/bw/package-lock.json'));
   const cliVersion = manifest.dependencies['@bitwarden/cli'];
   const multerVersion = manifest.overrides['@bitwarden/cli'].multer;
+  const forgeVersion = manifest.overrides['@bitwarden/cli']['node-forge'];
   const tmpVersion = manifest.overrides['external-editor'].tmp;
-  for (const version of [cliVersion, multerVersion, tmpVersion])
+  for (const version of [cliVersion, multerVersion, forgeVersion, tmpVersion])
     assert.match(version, /^\d+\.\d+\.\d+$/);
   assert.equal(manifest.private, true);
   assert.deepEqual(manifest.dependencies, { '@bitwarden/cli': cliVersion });
   assert.deepEqual(manifest.overrides, {
-    '@bitwarden/cli': { multer: multerVersion },
+    '@bitwarden/cli': { multer: multerVersion, 'node-forge': forgeVersion },
     'external-editor': { tmp: tmpVersion },
   });
   assert.equal(lock.lockfileVersion, 3);
@@ -269,6 +270,7 @@ test('bw installs integrity-locked CLI dependencies without lifecycle scripts', 
     cliVersion,
   );
   assert.equal(lock.packages['node_modules/multer'].version, multerVersion);
+  assert.equal(lock.packages['node_modules/node-forge'].version, forgeVersion);
   assert.equal(lock.packages['node_modules/tmp'].version, tmpVersion);
   for (const [path, entry] of Object.entries(lock.packages)) {
     if (!path) continue;

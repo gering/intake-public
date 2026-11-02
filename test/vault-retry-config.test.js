@@ -74,6 +74,9 @@ test('shutdown wait configuration is writer-only and defaults to 5000 with bound
       Number(value),
     );
   for (const value of [
+    '',
+    ' ',
+    '\t',
     '-1',
     '1.5',
     'invalid',
@@ -125,7 +128,7 @@ test('stuck-attempt configuration is writer-only and defaults to 10 within 1 thr
     );
 });
 
-test('Compose exposes retry timers and the stuck threshold only to writer without build inputs', async () => {
+test('Compose exposes retry timers, the stuck threshold and the shutdown wait only to writer without build inputs', async () => {
   const source = await readFile(
     new URL('../docker-compose.yml', import.meta.url),
     'utf8',
@@ -136,6 +139,7 @@ test('Compose exposes retry timers and the stuck threshold only to writer withou
     ['INTAKE_VAULT_RETRY_MAX_MS', 300000],
     ['INTAKE_STUCK_ATTEMPTS', 10],
     ['INTAKE_UNKNOWN_SETTLE_MS', 120000],
+    ['INTAKE_SHUTDOWN_WAIT_MS', 5000],
   ]) {
     assert.equal(
       stack.services.writer.environment[name],

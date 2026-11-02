@@ -597,25 +597,29 @@ CLI 2026.10.0 still requests `multer` 2.3.0, `node-forge` 1.4.0 and, through
 `inquirer`/`external-editor`, `tmp` 0.0.33. `docker/bw/package.json` retains
 targeted npm `overrides` for the fixable findings:
 
-- `multer` 2.3.0 → 2.4.0, scoped to `@bitwarden/cli` (same major; the CLI and
+- `multer` 2.3.0 → 2.5.0, scoped to `@bitwarden/cli` (same major; the CLI and
   `@koa/multer` use the unchanged public API). The override also applies to
-  `@koa/multer`'s shared dependency and removes the moderate `multer` advisory.
+  `@koa/multer`'s shared dependency and removes the moderate `multer` advisory
+  and the high one fixed in 2.5.0
+  ([GHSA-q7qp-rjg7-q26m](https://github.com/advisories/GHSA-q7qp-rjg7-q26m)).
+- `node-forge` 1.4.0 → 1.4.2, scoped to `@bitwarden/cli` (same major; the CLI
+  uses node-forge for AES decryption, HMAC and hashes). This removes the high
+  advisories fixed in 1.4.1
+  ([GHSA-7wch-p9px-956x](https://github.com/advisories/GHSA-7wch-p9px-956x),
+  [GHSA-jc66-7q78-782g](https://github.com/advisories/GHSA-jc66-7q78-782g),
+  [GHSA-8hrf-8g6f-7xwp](https://github.com/advisories/GHSA-8hrf-8g6f-7xwp),
+  [GHSA-hqq3-7jhf-c5jx](https://github.com/advisories/GHSA-hqq3-7jhf-c5jx),
+  [GHSA-5x38-2vff-x55p](https://github.com/advisories/GHSA-5x38-2vff-x55p))
+  and takes 1.4.2 out of the `<= 1.4.0` range of
+  [GHSA-86w9-cpqp-85rv](https://github.com/advisories/GHSA-86w9-cpqp-85rv), so
+  its former exception in [`.audit-allowlist.json`](.audit-allowlist.json) is
+  gone.
 - `tmp` 0.0.33 → 0.2.7, scoped to `external-editor`, which only calls
   `tmpNameSync`. This clears the affected `tmp`, `external-editor`, and
   `inquirer` entries.
 
-On 2026-10-19, with these overrides, `npm audit --package-lock-only` in
-`docker/bw` reports **2 vulnerable package entries (2 high; 0 critical,
-0 moderate, 0 low, 0 info)**: `node-forge` 1.4.0
-([GHSA-86w9-cpqp-85rv](https://github.com/advisories/GHSA-86w9-cpqp-85rv), no
-patched release exists) and its dependent `@bitwarden/cli`. These are one
-underlying advisory, not two separate exceptions. The advisory concerns RSA
-PKCS#1 v1.5 signature verification; the CLI uses node-forge only for AES
-decryption, HMAC and hashes, not for RSA signature verification, and `bw serve`
-has no published port; the writer is the only other service that mounts its
-private Unix socket. CI's dependency audit covers both lockfiles; node-forge is
-a documented, expiring exception scoped to `docker/bw` in
-[`.audit-allowlist.json`](.audit-allowlist.json), expiring on **2027-01-19**.
+On 2026-11-02, with these overrides, `npm audit --package-lock-only` in
+`docker/bw` reports **0 vulnerabilities**, and the audit allowlist is empty.
 The overrides pin versions outside the CLI's exact dependency pins, so
 validate the vault service end to end (login, unlock, item creation in the
 target collection through `bw serve`) after every change to `docker/bw`,
@@ -1920,8 +1924,11 @@ unit tests alone does not validate the deployed network/permission boundary.
 Run `npm run audit:check` with Node 22 to audit both the root and `docker/bw`
 lockfiles without installing their dependencies. The dependency audit
 also runs as a step of the `CI` / `test` job on pull requests, pushes to
-`main`, weekly, and on manual request; pull requests that only change
-Markdown files or `docs/` skip it (and lint, format and tests). Unapproved high/critical advisories, expired exceptions, invalid
+`main`, weekly, and on manual request. Documentation-only pull requests
+(only Markdown files or `LICENSE`) start no `CI` run (`paths-ignore`; the job
+applies the same rule) and no Docker build; `docs/` counts as code because it
+holds the systemd units. A newer push to a pull request cancels its superseded
+`CI`, `Docker` and `Security` runs; runs on `main` are never cancelled. Unapproved high/critical advisories, expired exceptions, invalid
 allowlists and incomplete audit responses fail the check; lower severities are
 reported, and stale exceptions produce warnings.
 

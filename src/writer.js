@@ -379,7 +379,8 @@ export async function startWriter({
     { requestTimeout: 15000, headersTimeout: 10000, maxHeaderSize: 4096 },
     async (req, res) => {
       try {
-        if (!ready || stopped) throw new IntakeError('writer_starting', 503);
+        if (stopped) throw new IntakeError('writer_stopping', 503);
+        if (!ready) throw new IntakeError('writer_starting', 503);
         if (req.method === 'GET' && req.url === '/healthz') {
           res.writeHead(204);
           res.end();
@@ -441,6 +442,7 @@ export async function startWriter({
       const delivery = notification;
       if (delivery) {
         let timeout;
+        const waitStarted = performance.now();
         try {
           if (shutdownWaitMs > 0)
             await Promise.race([
@@ -454,7 +456,8 @@ export async function startWriter({
             notificationAbort.abort();
             logger.info('shutdown_notification_pending', {
               id: delivery.id,
-              waitedMs: shutdownWaitMs,
+              // Measured, so a late timer (blocked event loop) is visible.
+              waitedMs: Math.round(performance.now() - waitStarted),
             });
           }
         } finally {

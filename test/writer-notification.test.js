@@ -282,7 +282,7 @@ for (const shutdownWaitMs of [100, 0]) {
       else assert.equal(deliverySignal.aborted, false);
       let deadline;
       try {
-        // Keep the test alive even though the writer's deadline is unref'ed.
+        // Fail fast if close() does not settle within the configured wait.
         await Promise.race([
           closing,
           new Promise((_, reject) => {
@@ -308,8 +308,17 @@ for (const shutdownWaitMs of [100, 0]) {
         time: pending[0].time,
         event: 'shutdown_notification_pending',
         id: ticket.id,
-        waitedMs: shutdownWaitMs,
+        waitedMs: pending[0].waitedMs,
       });
+      // waitedMs is measured, so allow timer jitter above the configured wait.
+      assert(Number.isSafeInteger(pending[0].waitedMs));
+      if (shutdownWaitMs === 0) assert.equal(pending[0].waitedMs, 0);
+      else
+        assert(
+          pending[0].waitedMs >= shutdownWaitMs - 1 &&
+            pending[0].waitedMs < 1000,
+          `waitedMs ${pending[0].waitedMs}`,
+        );
       gate.resolve(sent);
       await new Promise((resolve) => setImmediate(resolve));
       state = f.store.getState(ticket.id);
@@ -325,6 +334,82 @@ for (const shutdownWaitMs of [100, 0]) {
     },
   );
 }
+
+test(
+  'shutdown logs the measured wait when the deadline fires late',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await notificationFixture(t);
+    const ticket = await f.queue();
+    const gate = Promise.withResolvers();
+    t.after(() => gate.resolve(sent));
+    const writer = await f.start(
+      { send: () => gate.promise },
+      { shutdownWaitMs: 100 },
+    );
+    await writer.drain();
+    const closing = f.stop();
+    // Block the event loop past the deadline so the timer fires late.
+    const blockedUntil = performance.now() + 300;
+    while (performance.now() < blockedUntil);
+    await closing;
+    const pending = f.logs
+      .map((line) => JSON.parse(line))
+      .filter((line) => line.event === 'shutdown_notification_pending');
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0].id, ticket.id);
+    assert(Number.isSafeInteger(pending[0].waitedMs));
+    assert(pending[0].waitedMs >= 300, `waitedMs ${pending[0].waitedMs}`);
+  },
+);
+
+test(
+  'shutdown records a real MailNotifier retry that succeeds within the wait',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await notificationFixture(t);
+    const firstAttempt = Promise.withResolvers();
+    const statuses = [503, 200];
+    let requests = 0;
+    const server = createServer(async (req, res) => {
+      for await (const chunk of req) void chunk;
+      const status = statuses[requests] ?? 500;
+      requests += 1;
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(status === 200 ? '{}' : '');
+      if (requests === 1) firstAttempt.resolve();
+    });
+    await listen(server, { host: '127.0.0.1', port: 0 });
+    t.after(
+      () =>
+        new Promise((resolve) => {
+          server.close(resolve);
+          server.closeAllConnections();
+        }),
+    );
+    const ticket = await f.queue();
+    await f.start(
+      new MailNotifier({
+        url: `http://127.0.0.1:${server.address().port}`,
+        token: 'notification-test-token',
+        mailbox: 'intake@example.com',
+        backoffMs: [200, 200],
+      }),
+      { shutdownWaitMs: 2000 },
+    );
+    await firstAttempt.promise;
+    await f.stop();
+    assert.equal(requests, 2);
+    const state = assertTerminal(f, ticket.id);
+    assert.equal(state.notifyStatus, 'sent');
+    assert.equal(state.notifyAttempts, 2);
+    assert(
+      !f.logs.some(
+        (line) => JSON.parse(line).event === 'shutdown_notification_pending',
+      ),
+    );
+  },
+);
 
 test(
   'shutdown stops the socket, notification backlog and new vault work while allowing in-flight work to finish',
@@ -372,6 +457,22 @@ test(
       await assert.rejects(
         writerRequest(f.config.socketPath, '/process', pending[1].id),
       );
+      // Requests on connections that were already open get a stopping code.
+      const response = {};
+      writer.server.emit(
+        'request',
+        { method: 'GET', url: '/healthz', headers: {} },
+        {
+          writeHead(status) {
+            response.status = status;
+          },
+          end(body) {
+            response.body = body;
+          },
+        },
+      );
+      assert.equal(response.status, 503);
+      assert.deepEqual(JSON.parse(response.body), { error: 'writer_stopping' });
       void writer.drain();
       mailGate.resolve(sent);
       await waitFor(
