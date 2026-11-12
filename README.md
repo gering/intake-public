@@ -573,7 +573,7 @@ but before recording `sent` can cause a duplicate email.
 Use a Linux Docker Engine with Compose v2 or newer, local named-volume storage
 suitable for SQLite WAL, and an existing trusted HTTPS tunnel connector. This
 stack can run next to an existing Vaultwarden server; it does not deploy or expose
-the vault server itself. The images pin Node `22.23.4-bookworm-slim` by digest and
+the vault server itself. The images pin Node `22.23.5-bookworm-slim` by digest and
 `@bitwarden/cli@2026.10.0`. The bw build installs from committed
 `docker/bw/package.json` and `package-lock.json` with
 `npm ci --omit=dev --ignore-scripts`, including integrity-locked transitive
@@ -1939,7 +1939,7 @@ entry requires the exact GHSA `id`, npm `package`, `target` (`root` or
 package; remove it when no longer needed and review it before expiry.
 
 The separate `Security` / `scan` job (`.github/workflows/security.yml`, self-hosted
-`s2` runner) runs on every pull request (including documentation-only ones),
+`dev-1` runner) runs on every pull request (including documentation-only ones),
 on pushes to `main`, on manual request and weekly on Mondays at 04:47 UTC,
 normally in under a minute, and
 writes its results to the job summary:
